@@ -8,6 +8,7 @@ from typing import Dict, Iterable, List, Tuple
 import networkx as nx
 import numpy as np
 import pandas as pd
+from networkx.algorithms.community import greedy_modularity_communities
 
 def _entropy(values: np.ndarray) -> float:
     values = np.asarray(values, dtype=float)
@@ -88,6 +89,30 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
     # precompute global centralities where feasible
     undirected = g.to_undirected(as_view=False)
     clustering = nx.clustering(undirected)
+    try:
+        eigenvector = nx.eigenvector_centrality(
+            undirected,
+            max_iter=1000,
+        )
+    except Exception:
+        eigenvector = {n: 0.0 for n in g.nodes()}
+
+    try:
+        communities = list(
+            greedy_modularity_communities(undirected)
+        )
+        community_size_map = {}
+
+        for community in communities:
+            size = len(community)
+
+            for node in community:
+                community_size_map[node] = size 
+    
+    except Exception:
+        community_size_map = {
+            n: 1 for n in g.nodes()
+        }
     if len(g) <= 1000:
         betweenness = nx.betweenness_centrality(g, normalized=True)
     else:
@@ -159,6 +184,7 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
                 "weighted_out_degree": sum(out_amt) if len(out_amt) else 0.0,
                 "weighted_degree": (sum(in_amt) if len(in_amt) else 0.0) + (sum(out_amt) if len(out_amt) else 0.0),
                 "betweenness_centrality": float(betweenness.get(node, 0.0)),
+                "eigenvector_centrality": float(eigenvector.get(node, 0.0)),
                 "clustering_coefficient": float(clustering.get(node, 0.0)),
                 "tx_count": tx_count,
                 "velocity_7d": velocity,
@@ -181,6 +207,7 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
                 "short_cycle_score": cycle_part,
                 "local_density": local_density,
                 "is_isolated": int(g.in_degree(node) == 0 and g.out_degree(node) == 0),
+                "community_size": int(community_size_map.get(node, 1)),
             }
         )
 
@@ -189,6 +216,8 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
     # Add robust ratios
     feat["in_out_degree_ratio"] = feat["in_degree"] / (feat["out_degree"] + 1.0)
     feat["in_out_amount_ratio"] = feat["incoming_amount_total"] / (feat["outgoing_amount_total"] + 1.0)
+    feat["cashflow_ratio"] = (feat["incoming_amount_total"] / (feat["outgoing_amount_total"] + 1.0))
+    feat["fanout_ratio"] = (feat["unique_out_counterparties"] / (feat["unique_in_counterparties"] + 1.0))
     feat["degree_balance"] = (feat["in_degree"] - feat["out_degree"]).abs()
     feat["amount_balance"] = (feat["incoming_amount_total"] - feat["outgoing_amount_total"]).abs()
 

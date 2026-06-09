@@ -34,19 +34,26 @@ class ModelArtifacts:
     feature_columns: list[str]
     threshold_high: float
     threshold_medium: float
+    metadata: dict
 
 
-def _build_supervised_model(random_state: int = 42):
+def _build_supervised_model(
+    scale_pos_weight: float = 1.0, 
+    random_state: int = 42
+):
     if HAS_XGB:
         return XGBClassifier(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.05,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=1.0,
-            random_state=random_state,
+            objective="binary:logistic",
             eval_metric="logloss",
+            n_estimators=500,
+            max_depth=6,
+            learning_rate=0.03,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=2.0,
+            tree_method="hist",
+            scale_pos_weight=scale_pos_weight,
+            random_state=random_state,
             n_jobs=4,
         )
     return HistGradientBoostingClassifier(
@@ -67,17 +74,29 @@ def train_models(
     X = feature_df[feature_columns]
 
     supervised_model = None
+    positive_count = 0
+    negative_count = 0
+    scale_pos_weight = 1.0
 
     if labels_df is not None and len(labels_df):
         merged = feature_df.merge(labels_df, on="account", how="inner")
-        if "Is Laundering" in merged.columns and merged["Is Laundering"].nunique() >= 2 and len(merged) >= 10:
-            y = merged["Is Laundering"].astype(int)
+        if "label" in merged.columns and merged["label"].nunique() >= 2 and len(merged) >= 10:
+            y = merged["label"].astype(int)
             X_train = merged[feature_columns]
+            
+            positive_count = int(y.sum())
+            
+            negative_count = len(y) - positive_count 
+            
+            scale_pos_weight = max(
+                negative_count / max(positive_count, 1),
+                1.0,
+            )
             supervised_model = Pipeline(
                 steps=[
                     ("imputer", SimpleImputer(strategy="median")),
                     ("scaler", StandardScaler()),
-                    ("model", _build_supervised_model(random_state=random_state)),
+                    ("model", _build_supervised_model(scale_pos_weight=scale_pos_weight, random_state=random_state,)),
                 ]
             )
             supervised_model.fit(X_train, y)
@@ -96,12 +115,44 @@ def train_models(
     )
     anomaly_model.fit(X)
 
+    if supervised_model is not None:
+        sup_prob_train = _supervised_prob(supervised_model, X,)
+    else:
+        sup_prob_train = np.zeros(len(X), dtype=float,)
+    
+    X_imp = anomaly_model.named_steps["imputer"].transform(X)
+
+    X_scaled = anomaly_model.named_steps["scaler"].transform(X_imp)
+
+    iso = anomaly_model.named_steps["model"]
+
+    anomaly_raw = -iso.score_samples(X_scaled)
+
+    if (np.nanmax(anomaly_raw) - np.nanmin(anomaly_raw)) > 1e-9:
+        anomaly_score_train = (anomaly_raw - np.nanmin(anomaly_raw)) / (np.nanmax(anomaly_raw) - np.nanmin(anomaly_raw))
+    else:
+        anomaly_score_train = np.zeros(len(X), dtype=float,)
+    
+    training_risk_scores = (0.80 * sup_prob_train + 0.20 * anomaly_score_train)
+
+    threshold_medium = float(np.qantile(training_risk_scores, 0.95))
+
+    threshold_high = float(np.quantile(training_risk_scores, 0.99))
+
     return ModelArtifacts(
         supervised_model=supervised_model,
         anomaly_model=anomaly_model,
         feature_columns=feature_columns,
-        threshold_high=0.75,
-        threshold_medium=0.50,
+        threshold_high=threshold_high,
+        threshold_medium=threshold_medium,
+        metadata = {
+            "model_type": "XGBoost" if HAS_XGB else "HistGradientBoosting",
+            "training_samples": int(len(feature_df)),
+            "feature_count":int(len(feature_columns)),
+            "positive_labels": int(positive_count) if labels_df is not None else 0,
+            "negative_labels": int(negative_count) if labels_df is not None else 0,
+            "scale_pos_weight": float(scale_pos_weight) if labels_df is not None else 1.0,
+        },
     )
 
 
@@ -131,7 +182,7 @@ def score_accounts(feature_df: pd.DataFrame, artifacts: ModelArtifacts) -> pd.Da
     else:
         anomaly_score = np.zeros(len(X), dtype=float)
 
-    risk_score = 0.65 * sup_prob + 0.35 * anomaly_score
+    risk_score = 0.80 * sup_prob + 0.20 * anomaly_score
     out = feature_df[["account"]].copy()
     out["supervised_probability"] = sup_prob
     out["anomaly_score"] = anomaly_score
@@ -146,13 +197,13 @@ def score_accounts(feature_df: pd.DataFrame, artifacts: ModelArtifacts) -> pd.Da
 
 
 def evaluate_if_labels_available(scored_accounts: pd.DataFrame, labels_df: pd.DataFrame | None) -> dict:
-    if labels_df is None or len(labels_df) == 0 or "Is Laundering" not in labels_df.columns:
+    if labels_df is None or len(labels_df) == 0 or "label" not in labels_df.columns:
         return {}
     merged = scored_accounts.merge(labels_df, on="account", how="inner")
-    if merged["Is Laundering"].nunique() < 2:
+    if merged["label"].nunique() < 2:
         return {}
 
-    y_true = merged["Is Laundering"].astype(int)
+    y_true = merged["label"].astype(int)
     y_prob = merged["risk_score"].astype(float)
     y_pred = (y_prob >= 0.5).astype(int)
 

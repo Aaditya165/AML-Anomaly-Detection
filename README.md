@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # AML Transaction Graph Intelligence Dashboard
 
 A Streamlit-based AML investigation prototype that uses only the transactions CSV to train and score accounts.
@@ -84,7 +83,4 @@ streamlit run app.py
 - If `Is Laundering` is missing, the supervised model is skipped and the system falls back to anomaly scoring.
 - For large graphs, only the highest-risk subgraph is rendered.
 - The code is designed as a prototype for internal AML review, not as a production alerting system.
-=======
-# AML-Anomaly-Detection
-Pvt for now, working on it
->>>>>>> d798b7b33c8cab2e75437b344fd9872a82e84573
+
