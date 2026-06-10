@@ -48,7 +48,7 @@ def _canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     for c in cols:
         norm = normalize_colname(c)
         low = norm.lower()
-        if low in ["account", "Account.1"]:
+        if low in ["account", "account.1"]:
             account_seen += 1
             renamed[c] = "from_account" if account_seen == 1 else "to_account"
         elif low in ALT_EXPECTED:
