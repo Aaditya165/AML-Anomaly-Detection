@@ -61,12 +61,12 @@ def _canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         out = out.rename(columns={"account_1": "to_account"})
     return out
 
-def load_transactions(path: str | Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
+def load_transactions(source) -> pd.DataFrame:
+    df = pd.read_csv(source)
     df = _canonicalize_columns(df)
 
     if "timestamp" not in df.columns:
-        raise ValueError(f"Timestamp column missing in {path}")
+        raise ValueError(f"Timestamp column missing in {source}")
     if "from_account" not in df.columns or "to_account" not in df.columns:
         raise ValueError(
             "Could not locate both account columns. Expected duplicate Account columns in raw IBM AML file."

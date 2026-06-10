@@ -1,0 +1,4 @@
+Timestamp,From Bank,Account,To Bank,Account.1,Amount Received,Receiving Currency,Amount Paid,Payment Currency,Payment Format,Is Laundering
+9/3/2022 12:18,1,A1,2,A2,10000,NPR,10000,NPR,card,1
+9/3/2022 12:20,2,A2,1,A1,10000,NPR,10000,NPR,card,1
+9/3/2022 12:20,3,A3,1,A1,10000,NPR,10000,NPR,card,0

@@ -15,7 +15,7 @@ def find_transaction_files(path: str | Path) -> list[Path]:
     if p.is_file():
         return [p]
     patterns = ["*_trans.csv", "*trans.csv", "*.csv"]
-    files: list[Path] = []
+    files: list[Path] = [] #initialise an empty list named files and uses type hinting to specify that the list should only contain PATH objects
     for pat in patterns:
         files.extend(sorted(p.glob(pat)))
     # preserve order, deduplicate

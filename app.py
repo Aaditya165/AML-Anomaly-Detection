@@ -22,15 +22,16 @@ cfg = AppConfig()
 
 with st.sidebar:
     st.header("Data")
-    mode = st.radio("Mode", ["Train and save pickle", "Load saved pickle"], index=0)
+    mode = st.radio("Mode", ["Train and save pickle", "Load saved pickle"], index=1) #paila 0 thiyo
 
-    data_path = st.text_input("Transaction CSV or folder", value=str(Path.cwd()))
+    #data_path = st.text_input("Transaction CSV or folder", value=str(Path.cwd()))
+    uploaded_csv = st.file_uploader("Upload transaction CSV", type=["csv"])
     temporal_window_days = st.slider("Temporal window for velocity", 1, 30, cfg.temporal_window_days)
     max_graph_nodes = st.slider("Graph node cap", 50, 300, cfg.max_graph_nodes, 10)
     max_alerts = st.slider("Alert rows", 25, 500, cfg.top_alerts, 25)
 
-    files = find_transaction_files(data_path)
-    choice = st.selectbox("Transaction file", [str(f) for f in files]) if files else None
+    #files = find_transaction_files(data_path)
+    #choice = st.selectbox("Transaction file", [str(f) for f in files]) if files else None
 
     if mode == "Train and save pickle":
         model_path = st.text_input("Save trained pickle as", value=str(Path.cwd() / "artifacts" / "aml_model.pkl"))
@@ -39,16 +40,20 @@ with st.sidebar:
         uploaded_model = st.file_uploader("Upload pickle file", type=["pkl", "pickle"])
         model_path = None
 
-run_disabled = choice is None or (mode == "Load saved pickle" and uploaded_model is None)
+#run_disabled = choice is None or (mode == "Load saved pickle" and uploaded_model is None)
+run_disabled = ( uploaded_csv is None or ( mode == "Load saved pickle" and uploaded_model is None ) )
 run = st.button("Run analysis", type="primary", disabled=run_disabled)
 
-if not choice:
-    st.info("Point the app at a folder containing the IBM AML `*_trans.csv` file.")
+# if not choice:
+#     st.info("Point the app at a folder containing the IBM AML `*_trans.csv` file.")
+#     st.stop()
+if uploaded_csv is None:
+    st.info( "Upload a transaction CSV file" )
     st.stop()
 
 if run or "result" not in st.session_state:
     with st.spinner("Processing..."):
-        tx = load_transactions(choice)
+        tx = load_transactions(uploaded_csv)
         feat = compute_account_features(tx, temporal_window_days=temporal_window_days)
         labels = aggregate_labels_to_account(tx)
 
@@ -62,6 +67,12 @@ if run or "result" not in st.session_state:
                 except Exception as e:
                     st.sidebar.warning(f"Could not save pickle model: {e}")
         else:
+            if uploaded_model is None:
+                st.error("Please upload a pickle model.")
+                st.stop()
+            
+            # st.write(type(uploaded_model))
+            # st.write(uploaded_model)
             artifacts = load_artifacts(uploaded_model)
 
         scored = score_accounts(feat, artifacts).sort_values("risk_score", ascending=False).reset_index(drop=True)
@@ -95,12 +106,70 @@ with left:
 
 with right:
     if metrics:
-        st.subheader("Model metrics")
+        st.subheader("Model Metrics")
+
         mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Precision", f"{metrics.get('precision', 0):.3f}")
-        mc2.metric("Recall", f"{metrics.get('recall', 0):.3f}")
-        mc3.metric("PR-AUC", f"{metrics.get('pr_auc', 0):.3f}")
-        st.json(metrics)
+
+        mc1.metric(
+            "Precision",
+            f"{metrics.get('precision', 0):.3f}"
+        )
+
+        mc2.metric(
+            "Recall",
+            f"{metrics.get('recall', 0):.3f}"
+        )
+
+        mc3.metric(
+            "PR-AUC",
+            f"{metrics.get('pr_auc', 0):.3f}"
+        )
+
+        metric_df = pd.DataFrame({
+            "Metric": [
+                "Precision",
+                "Recall",
+                "F1 Score",
+                "ROC AUC",
+                "PR AUC",
+            ],
+            "Value": [
+                metrics.get("precision", 0),
+                metrics.get("recall", 0),
+                metrics.get("f1", 0),
+                metrics.get("roc_auc", 0),
+                metrics.get("pr_auc", 0),
+            ]
+        })
+
+        st.dataframe(
+            metric_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if "confusion_matrix" in metrics:
+
+            cm = metrics["confusion_matrix"]
+
+            cm_df = pd.DataFrame(
+                cm,
+                index=[
+                    "Actual Non-Laundering",
+                    "Actual Laundering",
+                ],
+                columns=[
+                    "Predicted Non-Laundering",
+                    "Predicted Laundering",
+                ],
+            )
+
+            st.subheader("Confusion Matrix")
+
+            st.dataframe(
+                cm_df,
+                use_container_width=True,
+            )
     else:
         st.info("No usable laundering labels were found in this file, so only anomaly scoring is available.")
 
