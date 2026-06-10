@@ -135,7 +135,7 @@ def train_models(
     
     training_risk_scores = (0.80 * sup_prob_train + 0.20 * anomaly_score_train)
 
-    threshold_medium = float(np.qantile(training_risk_scores, 0.95))
+    threshold_medium = float(np.quantile(training_risk_scores, 0.95))
 
     threshold_high = float(np.quantile(training_risk_scores, 0.99))
 
