@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import io 
 
 from src.config import AppConfig
 from src.data import load_transactions
@@ -12,6 +13,32 @@ from src.features import aggregate_labels_to_account, compute_account_features
 from src.graph_viz import build_risk_subgraph, plot_network
 from src.models import evaluate_if_labels_available, load_artifacts, save_artifacts, score_accounts, train_models
 from src.utils import find_transaction_files
+
+#cachine
+@st.cache_data(show_spinner=False)
+def _load_and_featurize(csv_bytes: bytes, temporal_window_days: int):
+    """Cached: re-runs only when path or temporal_window_days changes."""
+    tx = load_transactions(io.BytesIO(csv_bytes))
+    feat = compute_account_features(
+        tx, 
+        temporal_window_days=temporal_window_days
+    )
+    labels = aggregate_labels_to_account(tx)
+    return tx, feat, labels
+
+
+@st.cache_data(show_spinner=False)
+def _cached_train(csv_bytes: bytes, temporal_window_days: int, random_state: int):
+    """Cached: re-runs only when path, window, or seed changes."""
+    _, feat, labels = _load_and_featurize(
+        csv_bytes, 
+        temporal_window_days
+    )
+    return train_models(feat, labels if len(labels) else None, random_state=random_state)
+
+@st.cache_data(show_spinner=False)
+def _load_cached_artifacts(model_bytes: bytes):
+    return load_artifacts(model_bytes)
 
 st.set_page_config(page_title="AML Transaction Graph Intelligence Dashboard", layout="wide")
 
@@ -24,14 +51,10 @@ with st.sidebar:
     st.header("Data")
     mode = st.radio("Mode", ["Train and save pickle", "Load saved pickle"], index=1) #paila 0 thiyo
 
-    #data_path = st.text_input("Transaction CSV or folder", value=str(Path.cwd()))
     uploaded_csv = st.file_uploader("Upload transaction CSV", type=["csv"])
     temporal_window_days = st.slider("Temporal window for velocity", 1, 30, cfg.temporal_window_days)
     max_graph_nodes = st.slider("Graph node cap", 50, 300, cfg.max_graph_nodes, 10)
     max_alerts = st.slider("Alert rows", 25, 500, cfg.top_alerts, 25)
-
-    #files = find_transaction_files(data_path)
-    #choice = st.selectbox("Transaction file", [str(f) for f in files]) if files else None
 
     if mode == "Train and save pickle":
         model_path = st.text_input("Save trained pickle as", value=str(Path.cwd() / "artifacts" / "aml_model.pkl"))
@@ -40,25 +63,24 @@ with st.sidebar:
         uploaded_model = st.file_uploader("Upload pickle file", type=["pkl", "pickle"])
         model_path = None
 
-#run_disabled = choice is None or (mode == "Load saved pickle" and uploaded_model is None)
 run_disabled = ( uploaded_csv is None or ( mode == "Load saved pickle" and uploaded_model is None ) )
 run = st.button("Run analysis", type="primary", disabled=run_disabled)
 
-# if not choice:
-#     st.info("Point the app at a folder containing the IBM AML `*_trans.csv` file.")
-#     st.stop()
 if uploaded_csv is None:
     st.info( "Upload a transaction CSV file" )
     st.stop()
 
 if run or "result" not in st.session_state:
-    with st.spinner("Processing..."):
-        tx = load_transactions(uploaded_csv)
-        feat = compute_account_features(tx, temporal_window_days=temporal_window_days)
-        labels = aggregate_labels_to_account(tx)
+    with st.spinner("Processing... (first run may take a minute; subsequent runs on the same file are instant)"):
+        
+        csv_bytes = uploaded_csv.getvalue()
+        tx, feat, labels = _load_and_featurize(
+            csv_bytes, 
+            temporal_window_days
+        )
 
         if mode == "Train and save pickle":
-            artifacts = train_models(feat, labels if len(labels) else None, random_state=cfg.random_state)
+            artifacts = _cached_train(csv_bytes, temporal_window_days, cfg.random_state)
             if model_path:
                 try:
                     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
@@ -67,13 +89,7 @@ if run or "result" not in st.session_state:
                 except Exception as e:
                     st.sidebar.warning(f"Could not save pickle model: {e}")
         else:
-            if uploaded_model is None:
-                st.error("Please upload a pickle model.")
-                st.stop()
-            
-            # st.write(type(uploaded_model))
-            # st.write(uploaded_model)
-            artifacts = load_artifacts(uploaded_model)
+            artifacts = _load_cached_artifacts(uploaded_model.getvalue())
 
         scored = score_accounts(feat, artifacts).sort_values("risk_score", ascending=False).reset_index(drop=True)
         metrics = evaluate_if_labels_available(scored, labels if len(labels) else None)
@@ -178,6 +194,10 @@ tab1, tab2, tab3 = st.tabs(["High-Risk Network View", "Alert Feed", "Portfolio A
 with tab1:
     st.subheader("High-risk network view")
     g = build_risk_subgraph(tx, scored, max_nodes=max_graph_nodes, hops=1)
+    
+    st.write("Nodes:", g.number_of_nodes())
+    st.write("Edges:", g.number_of_edges())
+
     fig = plot_network(g, scored)
     st.plotly_chart(fig, use_container_width=True)
     st.dataframe(
