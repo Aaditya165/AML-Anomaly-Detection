@@ -26,6 +26,12 @@ except Exception:
     HAS_XGB = False
     XGBClassifier = None  # type: ignore
 
+try:
+    import shap 
+    HAS_SHAP = True
+except Exception: 
+    HAS_SHAP = False
+
 
 @dataclass
 class ModelArtifacts:

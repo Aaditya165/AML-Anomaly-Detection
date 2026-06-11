@@ -5,10 +5,11 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import io 
+import networkx as nx
 
 from src.config import AppConfig
 from src.data import load_transactions
-from src.explain import explain_account, human_readable_reasons
+from src.explain import explain_account, human_readable_reasons, shap_explain_account, human_readable_shap
 from src.features import aggregate_labels_to_account, compute_account_features
 from src.graph_viz import build_risk_subgraph, plot_network
 from src.models import evaluate_if_labels_available, load_artifacts, save_artifacts, score_accounts, train_models
@@ -39,6 +40,15 @@ def _cached_train(csv_bytes: bytes, temporal_window_days: int, random_state: int
 @st.cache_data(show_spinner=False)
 def _load_cached_artifacts(model_bytes: bytes):
     return load_artifacts(model_bytes)
+
+@st.cache_data
+def build_cached_subgraph(tx, scored, max_nodes):
+    return build_risk_subgraph(
+        tx,
+        scored,
+        max_nodes=max_nodes,
+        hops=1
+    )
 
 st.set_page_config(page_title="AML Transaction Graph Intelligence Dashboard", layout="wide")
 
@@ -193,10 +203,15 @@ tab1, tab2, tab3 = st.tabs(["High-Risk Network View", "Alert Feed", "Portfolio A
 
 with tab1:
     st.subheader("High-risk network view")
-    g = build_risk_subgraph(tx, scored, max_nodes=max_graph_nodes, hops=1)
+    g = build_cached_subgraph(tx, scored, scored, max_graph_nodes)
     
     st.write("Nodes:", g.number_of_nodes())
     st.write("Edges:", g.number_of_edges())
+
+    st.write(
+        "Connected components:",
+        nx.number_connected_components(g.to_undirected)
+    )
 
     fig = plot_network(g, scored)
     st.plotly_chart(fig, use_container_width=True)
@@ -222,11 +237,29 @@ with tab2:
     )
 
     selected = st.selectbox("Inspect account", [""] + alerts["account"].astype(str).tolist())
+
     if selected:
-        reasons = explain_account(feat, selected, top_k=7)
         st.markdown(f"### Explanation for {selected}")
-        st.write(human_readable_reasons(reasons))
-        st.table(pd.DataFrame(reasons))
+
+        shap_reasons = shap_explain_account(
+            feat,
+            selected,
+            result["artifacts"],
+            top_k=7,
+        )
+
+        if len(shap_reasons):
+            st.subheader("SHAP Model Explanation")
+            st.write(human_readable_shap(shap_reasons))
+
+            st.dataframe(pd.DataFrame(shap_reasons), use_container_width=True,)
+
+        else:
+            reasons = explain_account(feat, selected, top_k=7,)
+            st.subheader("Feature Deviation Explanation")
+            st.write(human_readable_reasons(reasons))
+
+            st.dataframe(pd.DataFrame(reasons), use_container_width=True,)
 
 with tab3:
     st.subheader("Portfolio analytics")
