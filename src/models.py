@@ -1,9 +1,7 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 import pickle
-
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest
@@ -20,11 +18,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 try:
-    from xgboost import XGBClassifier  # type: ignore
+    from xgboost import XGBClassifier 
     HAS_XGB = True
 except Exception:
     HAS_XGB = False
-    XGBClassifier = None  # type: ignore
+    XGBClassifier = None  
 
 try:
     import shap 

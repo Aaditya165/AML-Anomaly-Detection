@@ -2,7 +2,6 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class AppConfig:
-    max_graph_nodes: int = 150
     top_alerts: int = 200
     temporal_window_days: int = 7
     graph_neighborhood_hops: int = 1

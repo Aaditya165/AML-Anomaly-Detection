@@ -18,9 +18,6 @@ def run_pipeline(
     tx = load_transactions(transaction_path)
     train_tx, val_tx, test_tx = train_val_test_split_by_time(tx)
 
-    # feat = compute_account_features(tx, temporal_window_days=temporal_window_days)
-    # labels = aggregate_labels_to_account(tx)
-
     train_feat = compute_account_features(
         train_tx, 
         temporal_window_days=temporal_window_days,
@@ -45,10 +42,6 @@ def run_pipeline(
         scored, 
         test_labels if len(test_labels) else None,
     )
-
-    # artifacts = train_models(feat, labels if len(labels) else None, random_state=random_state)
-    # scored = score_accounts(feat, artifacts)
-    # metrics = evaluate_if_labels_available(scored, labels if len(labels) else None)
 
     return {
         "transactions": tx,

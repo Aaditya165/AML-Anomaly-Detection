@@ -11,9 +11,7 @@ from src.config import AppConfig
 from src.data import load_transactions
 from src.explain import explain_account, human_readable_reasons, shap_explain_account, human_readable_shap
 from src.features import aggregate_labels_to_account, compute_account_features
-from src.graph_viz import build_risk_subgraph, plot_network
-from src.models import evaluate_if_labels_available, load_artifacts, save_artifacts, score_accounts, train_models
-from src.utils import find_transaction_files
+from src.models import evaluate_if_labels_available, load_artifacts, score_accounts, train_models
 
 #cachine
 @st.cache_data(show_spinner=False)
@@ -27,27 +25,10 @@ def _load_and_featurize(csv_bytes: bytes, temporal_window_days: int):
     labels = aggregate_labels_to_account(tx)
     return tx, feat, labels
 
-
-@st.cache_data(show_spinner=False)
-def _cached_train(csv_bytes: bytes, temporal_window_days: int, random_state: int):
-    """Cached: re-runs only when path, window, or seed changes."""
-    _, feat, labels = _load_and_featurize(
-        csv_bytes, 
-        temporal_window_days
-    )
-    return train_models(feat, labels if len(labels) else None, random_state=random_state)
-
-@st.cache_data(show_spinner=False)
-def _load_cached_artifacts(model_bytes: bytes):
-    return load_artifacts(model_bytes)
-
-@st.cache_data
-def build_cached_subgraph(tx, scored, max_nodes):
-    return build_risk_subgraph(
-        tx,
-        scored,
-        max_nodes=max_nodes,
-        hops=1
+@st.cache_resource #cache_resource used instead of cache_data because model objetc are considered resources, not data
+def load_default_model():
+    return load_artifacts(
+        str(Path.cwd()/ "artifacts"/ "aml_model.pkl")
     )
 
 st.set_page_config(page_title="AML Transaction Graph Intelligence Dashboard", layout="wide")
@@ -59,21 +40,14 @@ cfg = AppConfig()
 
 with st.sidebar:
     st.header("Data")
-    mode = st.radio("Mode", ["Train and save pickle", "Load saved pickle"], index=1) #paila 0 thiyo
 
     uploaded_csv = st.file_uploader("Upload transaction CSV", type=["csv"])
     temporal_window_days = st.slider("Temporal window for velocity", 1, 30, cfg.temporal_window_days)
     max_graph_nodes = st.slider("Graph node cap", 50, 300, cfg.max_graph_nodes, 10)
     max_alerts = st.slider("Alert rows", 25, 500, cfg.top_alerts, 25)
 
-    if mode == "Train and save pickle":
-        model_path = st.text_input("Save trained pickle as", value=str(Path.cwd() / "artifacts" / "aml_model.pkl"))
-        uploaded_model = None
-    else:
-        uploaded_model = st.file_uploader("Upload pickle file", type=["pkl", "pickle"])
-        model_path = None
 
-run_disabled = ( uploaded_csv is None or ( mode == "Load saved pickle" and uploaded_model is None ) )
+run_disabled = ( uploaded_csv is None )
 run = st.button("Run analysis", type="primary", disabled=run_disabled)
 
 if uploaded_csv is None:
@@ -89,17 +63,7 @@ if run or "result" not in st.session_state:
             temporal_window_days
         )
 
-        if mode == "Train and save pickle":
-            artifacts = _cached_train(csv_bytes, temporal_window_days, cfg.random_state)
-            if model_path:
-                try:
-                    Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-                    save_artifacts(artifacts, model_path)
-                    st.sidebar.success(f"Saved pickle model to {model_path}")
-                except Exception as e:
-                    st.sidebar.warning(f"Could not save pickle model: {e}")
-        else:
-            artifacts = _load_cached_artifacts(uploaded_model.getvalue())
+        artifacts = load_default_model()
 
         scored = score_accounts(feat, artifacts).sort_values("risk_score", ascending=False).reset_index(drop=True)
         metrics = evaluate_if_labels_available(scored, labels if len(labels) else None)
@@ -199,27 +163,8 @@ with right:
     else:
         st.info("No usable laundering labels were found in this file, so only anomaly scoring is available.")
 
-tab1, tab2, tab3 = st.tabs(["High-Risk Network View", "Alert Feed", "Portfolio Analytics Dashboard"])
 
-with tab1:
-    st.subheader("High-risk network view")
-    g = build_cached_subgraph(tx, scored, scored, max_graph_nodes)
-    
-    st.write("Nodes:", g.number_of_nodes())
-    st.write("Edges:", g.number_of_edges())
-
-    st.write(
-        "Connected components:",
-        nx.number_connected_components(g.to_undirected)
-    )
-
-    fig = plot_network(g, scored)
-    st.plotly_chart(fig, use_container_width=True)
-    st.dataframe(
-        scored.head(max_alerts)[["account", "risk_score", "risk_tier", "supervised_probability", "anomaly_score"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+tab2, tab3 = st.tabs(["Alert Feed", "Portfolio Analytics Dashboard"])
 
 with tab2:
     st.subheader("Alert feed")
@@ -276,11 +221,3 @@ with tab3:
     vol = tx_time.groupby("date")["amount_received"].sum().reset_index()
     st.line_chart(vol.set_index("date"))
 
-    st.write("Top risky accounts")
-    st.dataframe(
-        scored.head(20)[["account", "risk_score", "risk_tier", "supervised_probability", "anomaly_score"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-st.caption("This prototype uses the transactions CSV only, as requested. It is intended for internal investigation support, not autonomous AML decisioning.")
