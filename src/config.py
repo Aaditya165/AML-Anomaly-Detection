@@ -9,3 +9,4 @@ class AppConfig:
     suspicious_threshold_high: float = 0.75
     suspicious_threshold_medium: float = 0.50
     max_betweenness_nodes: int = 1000
+    max_graph_nodes = 200

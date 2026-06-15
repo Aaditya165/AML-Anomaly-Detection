@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from math import log2
 from typing import Dict, Iterable, List, Tuple
-
+import time
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -63,40 +63,58 @@ def _relay_score(in_times: list[pd.Timestamp], out_times: list[pd.Timestamp]) ->
 
 
 def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) -> pd.DataFrame:
+    t0 = time.time()
     g = build_transaction_graph(df)
+    print("Graph building: ", time.time() - t0)
     all_nodes = list(g.nodes())
 
     if not all_nodes:
         return pd.DataFrame()
     
+    t0 = time.time()
     undirected = g.to_undirected(as_view=False)
+    print("to undirected: ", time.time() - t0)
+    
+    t0 = time.time()
     clustering = nx.clustering(undirected)
+    print("nx clustering: ", time.time() - t0)
 
     try:
+        t0 = time.time()
         eigenvector = nx.eigenvector_centrality(undirected, max_iter=200, tol=1e-4)
+        print("eigenvector centrality: ", time.time() - t0)
     except Exception:
         eigenvector = {n: 0.0 for n in g.nodes()}
     
     try:
+        t0 = time.time()
         community_size_map = {}
         for community in label_propagation_communities(undirected):
             size = len(community)
             for node in community:
                 community_size_map[node] = size
+        
+        print("communities: ", time.time() - t0)
     except Exception:
         community_size_map = {n: 1 for n in g.nodes()}
 
     if len(g) <= 1000:
+        t0 = time.time()
         betweenness = nx.betweenness_centrality(g, normalized=True)
+        print("betweenness centrality if: ", time.time() - t0)
     else:
+        t0 = time.time()
         sample_k = min(200, len(g))
         betweenness = nx.betweenness_centrality(g, k=sample_k, seed=42, normalized=True)
+        print("betweenness centrality else: ", time.time() - t0)
     
+    t0 = time.time()
     scc_map = {}
     for component in nx.strongly_connected_components(g):
         size = len(component)
         for node in component:
             scc_map[node] = size 
+    print("SCC:", time.time() - t0)
     
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
