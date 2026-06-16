@@ -64,6 +64,7 @@ def _canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_transactions(source) -> pd.DataFrame:
     df = pd.read_csv(source)
     df = _canonicalize_columns(df)
+    df = df.drop(columns=["receiving_currency", "payment_currency"])
 
     if "timestamp" not in df.columns:
         raise ValueError(f"Timestamp column missing in {source}")
