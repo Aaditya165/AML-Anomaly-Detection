@@ -34,17 +34,12 @@ def build_transaction_graph(df: pd.DataFrame) -> nx.DiGraph:
     df_e["to_account"] = df_e["to_account"].astype(str)
     df_e["amount_received"] = df_e["amount_received"].fillna(0.0)
 
-    #iterate over unique (from, to) pairs
+    #iterate over unique (from, to) pairs, aggregate into one edge
     for (u,v), grp in df_e.groupby(["from_account", "to_account"]):
         g.add_edge(
             u, v,
             amount=float(grp["amount_received"].sum()),
-            count=len(grp),
-            amounts=grp["amount_received"].tolist(),
-            timestamps=grp["timestamp"].tolist(),
-            payment_formats=grp["payment_format"].astype(str).tolist() if "payment_format" in df.columns else [],
-            receiving_currencies=grp["receiving_currency"].astype(str).tolist() if "receiving_currency" in df.columns else [],
-            payment_currencies=grp["payment_currency"].astype(str).tolist() if "payment_currency" in df.columns else [],
+            count=len(grp),            
         )
     return g
 
@@ -81,7 +76,8 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
 
     try:
         t0 = time.time()
-        eigenvector = nx.eigenvector_centrality(undirected, max_iter=200, tol=1e-4)
+        #eigenvector = nx.eigenvector_centrality(undirected, max_iter=200, tol=1e-4)
+        eigenvector = {n: 0.0 for n in g.nodes()}
         print("eigenvector centrality: ", time.time() - t0)
     except Exception:
         eigenvector = {n: 0.0 for n in g.nodes()}
@@ -105,7 +101,8 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
     else:
         t0 = time.time()
         sample_k = min(200, len(g))
-        betweenness = nx.betweenness_centrality(g, k=sample_k, seed=42, normalized=True)
+        # betweenness = nx.betweenness_centrality(g, k=sample_k, seed=42, normalized=True)
+        betweenness = {n: 0.0 for n in g.nodes()}
         print("betweenness centrality else: ", time.time() - t0)
     
     t0 = time.time()
@@ -127,6 +124,7 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
         1.0,
     )
     # Outgoing stats
+    t0 = time.time()
     out_agg = df.groupby("from_account").agg(
         outgoing_amount_total=("amount_received", "sum"),
         outgoing_amount_mean=("amount_received", "mean"),
@@ -134,13 +132,24 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
         _out_tx_count=("amount_received", "count"),
         _out_max=("amount_received", "max"),
     ).rename_axis("account")
+    print("out agg:", time.time() - t0)
+    
+    t0 = time.time()
     out_agg["unique_out_counterparties"] = df.groupby("from_account")["to_account"].nunique()
+    print("unique_out_counterparties:", time.time() - t0)
+    
+    t0 = time.time()
     out_agg["outgoing_concentration"] = out_agg["_out_max"] / (out_agg["outgoing_amount_total"] + 1e-9)
+    print("outgoing_concentration:", time.time() - t0)
+    
+    t0 = time.time()
     out_agg["outgoing_entropy"] = df.groupby("from_account")["amount_received"].apply(
         lambda x: _entropy(x.values)
     )
+    print("outgoing_entropy:", time.time() - t0)
 
     # Incoming stats
+    t0 = time.time()
     in_agg = df.groupby("to_account").agg(
         incoming_amount_total=("amount_received", "sum"),
         incoming_amount_mean=("amount_received", "mean"),
@@ -148,28 +157,49 @@ def compute_account_features(df: pd.DataFrame, temporal_window_days: int = 7) ->
         _in_tx_count=("amount_received", "count"),
         _in_max=("amount_received", "max"),
     ).rename_axis("account")
+    print("in_agg:", time.time() - t0)
+    
+    t0 = time.time()
     in_agg["unique_in_counterparties"] = df.groupby("to_account")["from_account"].nunique()
+    print("unique_in_counterparties:", time.time() - t0)
+    
+    t0 = time.time()
     in_agg["incoming_concentration"] = in_agg["_in_max"] / (in_agg["incoming_amount_total"] + 1e-9)
+    print("incoming_concentration:", time.time() - t0)
+
+    t0 = time.time()
     in_agg["incoming_entropy"] = df.groupby("to_account")["amount_received"].apply(
         lambda x: _entropy(x.values)
     )
+    print("incoming_entropy:", time.time() - t0)
 
     # Gap stats - vectorised sort+diff across combined in+out timeline per account
     from_ts = df[["from_account", "timestamp"]].rename(columns={"from_account": "account"})
     to_ts = df[["to_account", "timestamp"]].rename(columns={"to_account": "account"})
     all_ts = pd.concat([from_ts, to_ts], ignore_index=True).sort_values(["account", "timestamp"])
+    
+    t0 = time.time()
     all_ts["gap_days"] = (
         all_ts["timestamp"] - all_ts.groupby("account")["timestamp"].shift(1)
     ).dt.total_seconds() / 86400.0
+    print("all_ts gap_days:", time.time() - t0)
+    
+    t0 = time.time()
     gap_agg = (
         all_ts.groupby("account")["gap_days"]
         .agg(max_gap_days="max", mean_gap_days="mean")
         .fillna(0.0)
     )
+    print("gap_agg:", time.time() - t0)
 
     # Pre-build time-lists for relay score (dict lookup is much faster than repeated get_group)
+    t0 = time.time()
     out_times_dict = df.groupby("from_account")["timestamp"].apply(list).to_dict()
+    print("out_times_dict:", time.time() - t0)
+
+    t0 = time.time()
     in_times_dict = df.groupby("to_account")["timestamp"].apply(list).to_dict()
+    print("in_times_dict:", time.time() - t0)
 
     # --- Per-node loop — now only relay_score and local_density remain ---
     DENSITY_DEGREE_CUTOFF = 100  # skip expensive subgraph for very high-degree nodes
