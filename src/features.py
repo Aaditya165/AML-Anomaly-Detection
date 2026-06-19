@@ -117,6 +117,8 @@ def compute_account_features(
         community_size_arr = np.ones(n)
 
     t0 = time.time()
+    #this part utilises sampling estimate betweenness centrality
+
     if n <= max_exact_betweenness_nodes:
         bc = nk.centrality.Betweenness(g, normalized=True)
         bc.run()
@@ -129,6 +131,13 @@ def compute_account_features(
         eb.run()
         betweenness_arr = np.array(eb.scores())
         print("betweenness centrality (sampled estimate): ", time.time() - t0)
+    
+    #if i want to run betweenness centrality on entire graph (very expensive)
+    # bc = nk.centrality.Betweenness(g, normalized=True)
+    # bc.run()
+
+    # betweenness_arr = np.array(bc.scores())
+    # print("betweenness centrality (exact): ", time.time() - t0)
 
     t0 = time.time()
     scc = nk.components.StronglyConnectedComponents(g)
