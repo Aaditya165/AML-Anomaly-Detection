@@ -5,7 +5,6 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import io 
-import networkx as nx
 
 from src.config import AppConfig
 from src.data import load_transactions
