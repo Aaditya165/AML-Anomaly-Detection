@@ -65,8 +65,21 @@ if run or "result" not in st.session_state:
 
         artifacts = load_default_model()
 
-        scored = score_accounts(feat, artifacts).sort_values("risk_score", ascending=False).reset_index(drop=True)
-        metrics = evaluate_if_labels_available(scored, labels if len(labels) else None)
+        scored = score_accounts(
+            feat, 
+            artifacts
+            ).sort_values(
+                "risk_score", 
+                ascending=False
+            ).reset_index(drop=True)
+        
+        if ( "is_laundering" in tx.column and not tx["is_laundering"].isna().all()):
+            metrics = evaluate_if_labels_available(
+                scored, 
+                labels if len(labels) else None
+            )
+        else: 
+            metrics = {}
 
         st.session_state["result"] = {
             "transactions": tx,
