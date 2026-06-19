@@ -6,17 +6,18 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
-from .data import load_transactions, train_val_test_split_by_time
+from .data import load_transactions
 from .features import aggregate_labels_to_account, compute_account_features
 from .models import ModelArtifacts, evaluate_if_labels_available, score_accounts, train_models
 
 def run_pipeline(
-    transaction_path: str | Path,
+    train_path: str | Path,
+    test_path: str | Path,
     temporal_window_days: int = 7,
     random_state: int = 42,
 ):
-    tx = load_transactions(transaction_path)
-    train_tx, val_tx, test_tx = train_val_test_split_by_time(tx)
+    train_tx = load_transactions(train_path)
+    test_tx = load_transactions(test_path)
 
     train_feat = compute_account_features(
         train_tx, 
@@ -44,11 +45,11 @@ def run_pipeline(
     )
 
     return {
-        "transactions": tx,
+        # "transactions": tx,
         "features": test_feat,
         "labels": test_labels,
         "scored": scored.sort_values("risk_score", ascending=False).reset_index(drop=True),
         "metrics": metrics,
         "artifacts": artifacts,
-        "splits": {"train": train_tx, "val": val_tx, "test": test_tx},
+        "splits": {"train": train_tx, "test": test_tx},
     }

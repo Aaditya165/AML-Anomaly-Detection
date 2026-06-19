@@ -64,7 +64,7 @@ def _canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_transactions(source) -> pd.DataFrame:
     df = pd.read_csv(source)
     df = _canonicalize_columns(df)
-    df = df.drop(columns=["receiving_currency", "payment_currency"])
+    #df = df.drop(columns=["receiving_currency", "payment_currency"])
 
     if "timestamp" not in df.columns:
         raise ValueError(f"Timestamp column missing in {source}")
@@ -97,13 +97,13 @@ def load_transactions(source) -> pd.DataFrame:
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
-def train_val_test_split_by_time(df: pd.DataFrame, train_ratio=0.6, val_ratio=0.2):
-    n = len(df)
-    if n == 0:
-        return df, df, df
-    train_end = int(n * train_ratio)
-    val_end = int(n * (train_ratio + val_ratio))
-    train = df.iloc[:train_end].copy()
-    val = df.iloc[train_end:val_end].copy()
-    test = df.iloc[val_end:].copy()
-    return train, val, test
+# def train_val_test_split_by_time(df: pd.DataFrame, train_ratio=0.6, val_ratio=0.2):
+#     n = len(df)
+#     if n == 0:
+#         return df, df, df
+#     train_end = int(n * train_ratio)
+#     val_end = int(n * (train_ratio + val_ratio))
+#     train = df.iloc[:train_end].copy()
+#     val = df.iloc[train_end:val_end].copy()
+#     test = df.iloc[val_end:].copy()
+#     return train, val, test
