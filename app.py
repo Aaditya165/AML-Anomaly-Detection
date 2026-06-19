@@ -72,7 +72,7 @@ if run or "result" not in st.session_state:
                 ascending=False
             ).reset_index(drop=True)
         
-        if ( "is_laundering" in tx.column and not tx["is_laundering"].isna().all()):
+        if ( "is_laundering" in tx.columns and not tx["is_laundering"].isna().all()):
             metrics = evaluate_if_labels_available(
                 scored, 
                 labels if len(labels) else None
