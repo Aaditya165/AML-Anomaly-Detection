@@ -71,7 +71,7 @@ def compute_account_features(
     df: pd.DataFrame,
     temporal_window_days: int = 7,
     max_exact_betweenness_nodes: int = 1000,
-    betweenness_samples: int = 200,
+    betweenness_samples: int = 5000,
 ) -> pd.DataFrame:
     t0 = time.time()
     g, acc_to_idx, idx_to_acc = build_transaction_graph_nk(df)
