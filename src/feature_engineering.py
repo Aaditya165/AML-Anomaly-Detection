@@ -126,8 +126,10 @@ def add_pair_history_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def add_flow_features(
     df: pd.DataFrame,
-    predecessors: list,
-    successors: list,
+    pred_indptr: list,
+    pred_indices: list,
+    succ_indptr: list,
+    succ_indices: list,
     edge_src: np.ndarray,
     edge_dst: np.ndarray,
 ) -> pd.DataFrame:
@@ -140,8 +142,8 @@ def add_flow_features(
     receiver_idx = df["receiver_idx"].values
 
     # Predecessor / Successor counts = raw graph in/out-degree.
-    pred_count = np.array([len(p) for p in predecessors], dtype=np.int32)
-    succ_count = np.array([len(s) for s in successors], dtype=np.int32)
+    pred_count = np.diff(pred_indptr).astype(np.int32)
+    succ_count = np.diff(succ_indptr).astype(np.int32)
     df["predecessor_count"] = pred_count
     df["successor_count"] = succ_count
 
@@ -149,11 +151,31 @@ def add_flow_features(
     # (captures aggregation/dispersal behavior, not just raw degree).
     fan_in = np.zeros(n, dtype=np.int32)
     fan_out = np.zeros(n, dtype=np.int32)
+    
     for t in range(n):
+
         if pred_count[t] > 0:
-            fan_in[t] = len(np.unique(sender_idx[predecessors[t]]))
+
+            preds = pred_indices[
+                pred_indptr[t]:
+                pred_indptr[t + 1]
+            ]
+
+            fan_in[t] = len(
+                np.unique(sender_idx[preds])
+            )
+
         if succ_count[t] > 0:
-            fan_out[t] = len(np.unique(receiver_idx[successors[t]]))
+
+            succs = succ_indices[
+                succ_indptr[t]:
+                succ_indptr[t + 1]
+            ]
+
+            fan_out[t] = len(
+                np.unique(receiver_idx[succs])
+            )
+    
     df["fan_in"] = fan_in
     df["fan_out"] = fan_out
 
@@ -368,14 +390,16 @@ def add_account_context_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def engineer_all_features(
     df: pd.DataFrame,
-    predecessors: list,
-    successors: list,
+    pred_indptr: list,
+    pred_indices: list,
+    succ_indptr: list,
+    succ_indices: list,
     edge_src: np.ndarray,
     edge_dst: np.ndarray,
 ) -> pd.DataFrame:
     df = add_temporal_features(df)
     df = add_pair_history_features(df)
-    df = add_flow_features(df, predecessors, successors, edge_src, edge_dst)
+    df = add_flow_features(df, pred_indptr, pred_indices, succ_indptr, succ_indices, edge_src, edge_dst)
     df = add_account_context_features(df)
     return df
 

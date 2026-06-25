@@ -28,6 +28,23 @@ import time
 TIME_WINDOW_NS = 10 * 24 * 3600 * 1_000_000_000  # 10 days, in ns
 MAX_SUCCESSORS = 15
 
+def build_csr(row_ids, col_ids, n_nodes):
+    counts = np.bincount(row_ids, minlength=n_nodes)
+
+    indptr = np.empty(n_nodes + 1, dtype=np.int64)
+    indptr[0] = 0
+    np.cumsum(counts, out=indptr[1:])
+
+    indices = np.empty(len(col_ids), dtype=np.int32)
+
+    write_pos = indptr[:-1].copy()
+
+    for r, c in zip(row_ids, col_ids):
+        pos = write_pos[r]
+        indices[pos] = c
+        write_pos[r] += 1
+
+    return indptr, indices
 
 def build_transaction_graph(df: pd.DataFrame):
     """
@@ -88,23 +105,36 @@ def build_transaction_graph(df: pd.DataFrame):
             edge_src.append(t1)
             edge_dst.append(int(t2))
 
-    edge_src = np.asarray(edge_src, dtype=np.int64)
-    edge_dst = np.asarray(edge_dst, dtype=np.int64)
+    edge_src = np.asarray(edge_src, dtype=np.int32)
+    edge_dst = np.asarray(edge_dst, dtype=np.int32)
 
     g.addEdges((edge_src, edge_dst), checkMultiEdge=False)
 
-    # ---- Step C: adjacency lists for downstream feature engineering ----
-    predecessors = [[] for _ in range(n)]
-    successors = [[] for _ in range(n)]
-    for s, d in zip(edge_src, edge_dst):
-        successors[s].append(d)
-        predecessors[d].append(s)
-    predecessors = [np.asarray(p, dtype=np.int64) for p in predecessors]
-    successors = [np.asarray(s, dtype=np.int64) for s in successors]
+    # ---- Step C: CSR adjacency ----
+
+    succ_indptr, succ_indices = build_csr(
+        edge_src,
+        edge_dst,
+        n
+    )
+
+    pred_indptr, pred_indices = build_csr(
+        edge_dst,
+        edge_src,
+        n
+    )
 
     print("02. Transaction Graph Construction: ", time.time() - t0)
 
-    return g, edge_src, edge_dst, predecessors, successors
+    return (
+        g,
+        edge_src,
+        edge_dst,
+        pred_indptr,
+        pred_indices,
+        succ_indptr,
+        succ_indices,
+    )   
 
 
 if __name__ == "__main__":

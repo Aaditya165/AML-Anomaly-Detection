@@ -41,7 +41,6 @@ def chronological_split(num_nodes: int, val_frac: float = 0.15):
 def train_model(
     model: nn.Module,
     data,
-    predecessors: list,
     num_epochs: int = 8,
     batch_size: int = 512,
     num_neighbors=(15, 10),
@@ -133,7 +132,7 @@ def _evaluate_loader(model, loader, loss_fn, device):
     return float(np.mean(losses)), float(pr_auc)
 
 
-def run_inference(model, data, predecessors, batch_size=1024, num_neighbors=(15, 10), device="cpu"):
+def run_inference(model, data, batch_size=1024, num_neighbors=(15, 10), device="cpu"):
     """Full-dataset scoring pass (PRD Section 14). Returns probs[N] aligned to data node order."""
     model.eval()
     all_idx = torch.arange(data.num_nodes)
