@@ -126,10 +126,8 @@ def add_pair_history_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def add_flow_features(
     df: pd.DataFrame,
-    pred_indptr: list,
-    pred_indices: list,
-    succ_indptr: list,
-    succ_indices: list,
+    predecessors,
+    successors,
     edge_src: np.ndarray,
     edge_dst: np.ndarray,
 ) -> pd.DataFrame:
@@ -142,8 +140,8 @@ def add_flow_features(
     receiver_idx = df["receiver_idx"].values
 
     # Predecessor / Successor counts = raw graph in/out-degree.
-    pred_count = np.diff(pred_indptr).astype(np.int32)
-    succ_count = np.diff(succ_indptr).astype(np.int32)
+    pred_count = predecessors.degrees().astype(np.int32)
+    succ_count = successors.degrees().astype(np.int32)
     df["predecessor_count"] = pred_count
     df["successor_count"] = succ_count
 
@@ -156,10 +154,7 @@ def add_flow_features(
 
         if pred_count[t] > 0:
 
-            preds = pred_indices[
-                pred_indptr[t]:
-                pred_indptr[t + 1]
-            ]
+            preds = predecessors[t]
 
             fan_in[t] = len(
                 np.unique(sender_idx[preds])
@@ -167,10 +162,7 @@ def add_flow_features(
 
         if succ_count[t] > 0:
 
-            succs = succ_indices[
-                succ_indptr[t]:
-                succ_indptr[t + 1]
-            ]
+            succs = successors[t]
 
             fan_out[t] = len(
                 np.unique(receiver_idx[succs])
@@ -390,16 +382,14 @@ def add_account_context_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def engineer_all_features(
     df: pd.DataFrame,
-    pred_indptr: list,
-    pred_indices: list,
-    succ_indptr: list,
-    succ_indices: list,
+    predecessors,
+    successors,
     edge_src: np.ndarray,
     edge_dst: np.ndarray,
 ) -> pd.DataFrame:
     df = add_temporal_features(df)
     df = add_pair_history_features(df)
-    df = add_flow_features(df, pred_indptr, pred_indices, succ_indptr, succ_indices, edge_src, edge_dst)
+    df = add_flow_features(df, preds, succs, edge_src, edge_dst)
     df = add_account_context_features(df)
     return df
 
