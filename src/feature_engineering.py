@@ -389,7 +389,7 @@ def engineer_all_features(
 ) -> pd.DataFrame:
     df = add_temporal_features(df)
     df = add_pair_history_features(df)
-    df = add_flow_features(df, preds, succs, edge_src, edge_dst)
+    df = add_flow_features(df, predecessors, successors, edge_src, edge_dst)
     df = add_account_context_features(df)
     return df
 
