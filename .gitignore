@@ -1,1 +1,3 @@
 data/*.csv
+AML_cache/*.parquet
+AML_cache/*.npy

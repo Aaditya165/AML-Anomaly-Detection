@@ -141,7 +141,7 @@ if __name__ == "__main__":
     from graph_construction import build_transaction_graph
     from feature_engineering import engineer_all_features
     from pyg_export import build_pyg_data, NUMERIC_FEATURE_COLUMNS
-    from torch_geometric.loader import NeighborLoader
+    from neighbor_sampling import SimpleNeighborLoader
 
     df, vocabs = load_and_clean("HI-Small_Trans_SYNTHETIC.csv")
     g, src, dst, preds, succs = build_transaction_graph(df)
@@ -158,8 +158,8 @@ if __name__ == "__main__":
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Total trainable parameters: {n_params:,}")
 
-    loader = NeighborLoader(
-        data, 
+    loader = SimpleNeighborLoader(
+        data, preds,
         num_neighbors=[15,10],
         input_nodes=torch.arange(data.num_nodes),
         batch_size=256,
