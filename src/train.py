@@ -73,7 +73,9 @@ def train_model(
     neg_per_pos: float = None,
     device: str = "cpu",
     verbose: bool = True,
-    checkpoint_dir="cache/checkpoints",
+    checkpoint_path=None,
+    save_every_epoch: bool = True,
+    resume: bool = True,
 ):
     """
     `neg_per_pos`: if set (e.g. 10.0), training SEEDS are subsampled to
@@ -81,6 +83,26 @@ def train_model(
     `subsample_negatives`) -- dramatically fewer batches/epoch on a
     heavily-imbalanced graph. None (default) = use every training node,
     matching the original behavior.
+
+    `checkpoint_path`: path to a single checkpoint FILE (e.g.
+    `cache/checkpoints/latest_checkpoint.pt`), not a directory -- the
+    caller picks the directory/filename (see the notebook, which builds
+    this from CHECKPOINT_DIR). None (default) disables checkpointing
+    entirely: nothing is saved, and `resume` is ignored.
+
+    `save_every_epoch`: if True (default) and `checkpoint_path` is set,
+    write a checkpoint after every epoch (model/optimizer/scheduler
+    state + history), so a Colab disconnect loses at most one epoch.
+    If False, checkpointing is skipped even though `checkpoint_path`
+    is set -- e.g. for a quick local smoke-test run you don't want to
+    clobber a real checkpoint with.
+
+    `resume`: if True (default) and a checkpoint already exists at
+    `checkpoint_path`, load model/optimizer/scheduler/history from it
+    and continue from the next epoch instead of starting over. If
+    False, any existing checkpoint at `checkpoint_path` is ignored
+    (training starts fresh from epoch 1) -- it will still be
+    overwritten by this run if `save_every_epoch` is also True.
     """
     model.to(device)
     train_idx, val_idx = chronological_split(data.num_nodes, val_frac)
@@ -123,19 +145,19 @@ def train_model(
         patience=2,
     )
 
-    checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    checkpoint_file = checkpoint_dir / "latest_checkpoint.pt"
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+    if checkpoint_path is not None:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     start_epoch = 1
+    history = {"train_loss": [], "val_loss": [], "val_pr_auc": []}
 
-    if checkpoint_file.exists():
+    if resume and checkpoint_path is not None and checkpoint_path.exists():
 
-        print(f"Resuming from {checkpoint_file}")
+        print(f"Resuming from {checkpoint_path}")
 
         ckpt = torch.load(
-            checkpoint_file,
+            checkpoint_path,
             map_location=device,
         )
 
@@ -154,17 +176,6 @@ def train_model(
         history = ckpt["history"]
 
         start_epoch = ckpt["epoch"] + 1
-
-    else:
-
-        history = {
-            "train_loss": [],
-            "val_loss": [],
-            "val_pr_auc": [],
-        }
-    
-
-    #history = {"train_loss": [], "val_loss": [], "val_pr_auc": []}
 
     t0_train = time.time()
     sample_time_total = 0.0
@@ -196,24 +207,25 @@ def train_model(
         history["val_pr_auc"].append(val_pr_auc)
         scheduler.step(val_pr_auc)
 
-        torch.save(
-            {
-                "epoch": epoch,
+        if save_every_epoch and checkpoint_path is not None:
+            torch.save(
+                {
+                    "epoch": epoch,
 
-                "model_state":
-                    model.state_dict(),
+                    "model_state":
+                        model.state_dict(),
 
-                "optimizer_state":
-                    optimizer.state_dict(),
+                    "optimizer_state":
+                        optimizer.state_dict(),
 
-                "scheduler_state":
-                    scheduler.state_dict(),
+                    "scheduler_state":
+                        scheduler.state_dict(),
 
-                "history":
-                    history,
-            },
-            checkpoint_file,
-        )
+                    "history":
+                        history,
+                },
+                checkpoint_path,
+            )
 
         if verbose:
             print(f"Epoch {epoch:>2d}/{num_epochs}  "
