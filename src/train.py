@@ -25,7 +25,7 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     average_precision_score, confusion_matrix,
 )
-from neighbor_sampling import SimpleNeighborLoader
+from .neighbor_sampling import SimpleNeighborLoader
 
 
 def chronological_split(num_nodes: int, val_frac: float = 0.15):
