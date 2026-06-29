@@ -20,6 +20,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+from pathlib import Path
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     average_precision_score, confusion_matrix,
@@ -72,6 +73,7 @@ def train_model(
     neg_per_pos: float = None,
     device: str = "cpu",
     verbose: bool = True,
+    checkpoint_dir="cache/checkpoints",
 ):
     """
     `neg_per_pos`: if set (e.g. 10.0), training SEEDS are subsampled to
@@ -113,16 +115,61 @@ def train_model(
               f"({int(n_pos)} positive / {int(n_neg)} negative)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=2
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=2,
     )
 
-    history = {"train_loss": [], "val_loss": [], "val_pr_auc": []}
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_file = checkpoint_dir / "latest_checkpoint.pt"
+
+    start_epoch = 1
+
+    if checkpoint_file.exists():
+
+        print(f"Resuming from {checkpoint_file}")
+
+        ckpt = torch.load(
+            checkpoint_file,
+            map_location=device,
+        )
+
+        model.load_state_dict(
+            ckpt["model_state"]
+        )
+
+        optimizer.load_state_dict(
+            ckpt["optimizer_state"]
+        )
+
+        scheduler.load_state_dict(
+            ckpt["scheduler_state"]
+        )
+
+        history = ckpt["history"]
+
+        start_epoch = ckpt["epoch"] + 1
+
+    else:
+
+        history = {
+            "train_loss": [],
+            "val_loss": [],
+            "val_pr_auc": [],
+        }
+    
+
+    #history = {"train_loss": [], "val_loss": [], "val_pr_auc": []}
 
     t0_train = time.time()
     sample_time_total = 0.0
     compute_time_total = 0.0
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(start_epoch, num_epochs + 1):
         model.train()
         epoch_losses = []
         t_sample_start = time.time()
@@ -148,6 +195,25 @@ def train_model(
         history["val_loss"].append(val_loss)
         history["val_pr_auc"].append(val_pr_auc)
         scheduler.step(val_pr_auc)
+
+        torch.save(
+            {
+                "epoch": epoch,
+
+                "model_state":
+                    model.state_dict(),
+
+                "optimizer_state":
+                    optimizer.state_dict(),
+
+                "scheduler_state":
+                    scheduler.state_dict(),
+
+                "history":
+                    history,
+            },
+            checkpoint_file,
+        )
 
         if verbose:
             print(f"Epoch {epoch:>2d}/{num_epochs}  "
