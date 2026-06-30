@@ -242,52 +242,65 @@ def add_flow_features(
 # ---------------------------------------------------------------------------
 # 03d. Account Context Features (single chronological streaming pass)
 # ---------------------------------------------------------------------------
-def _shannon_entropy(counts: dict) -> float:
-    total = sum(counts.values())
-    if total == 0:
-        return 0.0
-    ent = 0.0
-    for c in counts.values():
-        p = c / total
-        if p > 0:
-            ent -= p * math.log(p)
-    return ent
-
-
-def _concentration(counts: dict) -> float:
-    total = sum(counts.values())
-    if total == 0:
-        return 0.0
-    return max(counts.values()) / total
+def _safe_clogc(c: int) -> float:
+    return 0.0 if c <= 0 else c * math.log(c)
 
 
 class _AccountState:
-    """Running, causal (prior-only) profile for a single account."""
+    """Running, causal (prior-only) profile for a single account.
+
+    Summary stats (entropy, concentration, unique-counterparty count) are
+    maintained incrementally in O(1) amortized per update, rather than
+    recomputed from the full counterparty-count history on every snapshot.
+    The original version rebuilt these from scratch on every transaction,
+    making per-account cost O(degree^2) instead of O(degree) -- fine for
+    typical accounts, but catastrophic for high-degree hub/mule accounts.
+    """
     __slots__ = (
         "outflow_total", "inflow_total",
         "out_counterparty_counts", "in_counterparty_counts",
         "out_count", "in_count",
-        "activity_times",  # deque of all txn timestamps touching this account
+        "activity_times",
+        "unique_counterparties_set",
+        "sum_clogc",
+        "max_category_count",
     )
 
     def __init__(self):
         self.outflow_total = 0.0
         self.inflow_total = 0.0
-        self.out_counterparty_counts = defaultdict(int)
-        self.in_counterparty_counts = defaultdict(int)
+        self.out_counterparty_counts = {}
+        self.in_counterparty_counts = {}
         self.out_count = 0
         self.in_count = 0
         self.activity_times = deque()
+        self.unique_counterparties_set = set()
+        self.sum_clogc = 0.0
+        self.max_category_count = 0
+
+    def _bump(self, counts: dict, counterparty) -> None:
+        old = counts.get(counterparty, 0)
+        new = old + 1
+        counts[counterparty] = new
+        self.sum_clogc += _safe_clogc(new) - _safe_clogc(old)
+        if new > self.max_category_count:
+            self.max_category_count = new
+        self.unique_counterparties_set.add(counterparty)
+
+    def record_outgoing(self, counterparty, amt: float, now: int) -> None:
+        self.outflow_total += amt
+        self._bump(self.out_counterparty_counts, counterparty)
+        self.out_count += 1
+        self.activity_times.append(now)
+
+    def record_incoming(self, counterparty, amt: float, now: int) -> None:
+        self.inflow_total += amt
+        self._bump(self.in_counterparty_counts, counterparty)
+        self.in_count += 1
+        self.activity_times.append(now)
 
 
 def add_account_context_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Section 8: for BOTH the sender account and receiver account of every
-    transaction, attach: historical outflow/inflow totals, unique
-    counterparties, entropy, concentration, degree balance, and 1-day /
-    10-day velocity -- all computed using only transactions strictly
-    before the current one (causal / non-leaky).
-    """
     t0 = time.time()
     df = df.copy()
     n = len(df)
@@ -315,19 +328,14 @@ def add_account_context_features(df: pd.DataFrame) -> pd.DataFrame:
 
     def _snapshot(state: "_AccountState", now: int) -> dict:
         out_count, in_count = state.out_count, state.in_count
-        unique_cp = len(
-            set(state.out_counterparty_counts) | set(state.in_counterparty_counts)
+        total = out_count + in_count
+        unique_cp = len(state.unique_counterparties_set)
+        entropy = (
+            math.log(total) - state.sum_clogc / total
+            if total > 0 else 0.0
         )
-        # combine in/out distributions for an overall behavioral entropy
-        combined_counts = defaultdict(int)
-        for k, v in state.out_counterparty_counts.items():
-            combined_counts[("out", k)] += v
-        for k, v in state.in_counterparty_counts.items():
-            combined_counts[("in", k)] += v
-        entropy = _shannon_entropy(combined_counts)
-        concentration = _concentration(combined_counts)
-        denom = in_count + out_count
-        degree_balance = (in_count - out_count) / denom if denom > 0 else 0.0
+        concentration = state.max_category_count / total if total > 0 else 0.0
+        degree_balance = (in_count - out_count) / total if total > 0 else 0.0
         v1 = _velocity(state.activity_times, now, ONE_DAY_NS)
         v10 = _velocity(state.activity_times, now, TEN_DAYS_NS)
         return {
@@ -357,21 +365,14 @@ def add_account_context_features(df: pd.DataFrame) -> pd.DataFrame:
             receiver_feats[k][t] = v
 
         # ---- now apply this transaction's effect for future rows ----
-        s_state.outflow_total += amt
-        s_state.out_counterparty_counts[r] += 1
-        s_state.out_count += 1
-        s_state.activity_times.append(now)
-
-        r_state.inflow_total += amt
-        r_state.in_counterparty_counts[s] += 1
-        r_state.in_count += 1
-        r_state.activity_times.append(now)
+        s_state.record_outgoing(r, amt, now)
+        r_state.record_incoming(s, amt, now)
 
     for k, v in sender_feats.items():
         df[f"sender_{k}"] = v
     for k, v in receiver_feats.items():
         df[f"receiver_{k}"] = v
-    
+
     print("03d. Feature Engineering - Account Context Features: ", time.time() - t0)
 
     return df

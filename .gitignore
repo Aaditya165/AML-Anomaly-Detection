@@ -1,3 +1,8 @@
 data/*.csv
 AML_cache/*.npy
 AML_cache/*.parquet
+*.pth
+*.parquet
+*.pkl
+*.zip
+*.pt
