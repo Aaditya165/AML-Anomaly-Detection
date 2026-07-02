@@ -68,7 +68,11 @@ class LineMVGNN(nn.Module):
         self.payfmt_emb = nn.Embedding(n_payment_formats, half)
         self.currency_emb = nn.Embedding(n_currencies, half)        # payment & receiving currency share this table
 
-        embed_total_dim = emb_dim * 2 + half * 2 + half + half * 2
+        embed_total_dim = (
+            half + #payment format
+            half + #payment currency
+            half #receiving currency
+        )
         self.input_proj = nn.Linear(numeric_dim + embed_total_dim, hidden_dim)
 
         # ---- View A: structural / topology (attention over money flow) ----
