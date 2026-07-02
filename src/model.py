@@ -49,8 +49,8 @@ class LineMVGNN(nn.Module):
     def __init__(
         self,
         numeric_dim: int,
-        n_accounts: int,
-        n_banks: int,
+        #n_accounts: int,
+        #n_banks: int,
         n_payment_formats: int,
         n_currencies: int,
         emb_dim: int = 16,
@@ -63,8 +63,8 @@ class LineMVGNN(nn.Module):
         half = max(emb_dim // 2, 4)
 
         # ---- Section 6: learnable categorical embeddings ----
-        self.account_emb = nn.Embedding(n_accounts, emb_dim)        # sender & receiver share this table
-        self.bank_emb = nn.Embedding(n_banks, half)                 # from & to bank share this table
+        # self.account_emb = nn.Embedding(n_accounts, emb_dim)        # sender & receiver share this table
+        # self.bank_emb = nn.Embedding(n_banks, half)                 # from & to bank share this table
         self.payfmt_emb = nn.Embedding(n_payment_formats, half)
         self.currency_emb = nn.Embedding(n_currencies, half)        # payment & receiving currency share this table
 
@@ -102,10 +102,10 @@ class LineMVGNN(nn.Module):
 
     def embed_categoricals(self, batch) -> torch.Tensor:
         return torch.cat([
-            self.account_emb(batch.sender_idx),
-            self.account_emb(batch.receiver_idx),
-            self.bank_emb(batch.from_bank_idx),
-            self.bank_emb(batch.to_bank_idx),
+            # self.account_emb(batch.sender_idx),
+            # self.account_emb(batch.receiver_idx),
+            # self.bank_emb(batch.from_bank_idx),
+            # self.bank_emb(batch.to_bank_idx),
             self.payfmt_emb(batch.payment_format_idx),
             self.currency_emb(batch.payment_currency_idx),
             self.currency_emb(batch.receiving_currency_idx),

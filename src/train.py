@@ -66,7 +66,7 @@ def train_model(
     predecessors,
     num_epochs: int = 8,
     batch_size: int = 512,
-    num_neighbors=(15, 10),
+    num_neighbors=(25, 15),
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     val_frac: float = 0.15,
@@ -130,11 +130,20 @@ def train_model(
 
     n_pos = data.y[train_idx].sum().item()
     n_neg = len(train_idx) - n_pos
-    pos_weight = torch.tensor([n_neg / max(n_pos, 1.0)], device=device)
+    
+    if neg_per_pos is not None:
+        # If we already balanced the data via subsampling, DO NOT double-weight.
+        pos_weight = torch.tensor([1.0], device=device)
+        if verbose:
+            print("Subsampling enabled. pos_weight set to 1.0 to avoid double-counting.")
+    else:
+        # If using all data, apply the natural class weight.
+        pos_weight = torch.tensor([n_neg / max(n_pos, 1.0)], device=device)
+        if verbose:
+            print(f"Train pos_weight (class-imbalance correction): {pos_weight.item():.2f} "
+                  f"({int(n_pos)} positive / {int(n_neg)} negative)")
+
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    if verbose:
-        print(f"Train pos_weight (class-imbalance correction): {pos_weight.item():.2f} "
-              f"({int(n_pos)} positive / {int(n_neg)} negative)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     

@@ -45,8 +45,7 @@ import time
 
 
 TIME_WINDOW_NS = 10 * 24 * 3600 * 1_000_000_000  # 10 days, in ns
-MAX_SUCCESSORS = 15
-
+MAX_SUCCESSORS = 60
 
 class CSRAdjacency:
     """
