@@ -46,7 +46,12 @@ def build_vocab(series_list) -> dict:
 def apply_vocab(series: pd.Series, vocab: dict) -> np.ndarray:
     """Map values to codes; anything unseen at fit-time -> UNK bucket (= len(vocab))."""
     unk = len(vocab)
-    return series.map(vocab).fillna(unk).astype(np.int64).values
+
+    return np.fromiter(
+        (vocab.get(v, unk) for v in series),
+        dtype=np.int64,
+        count=len(series),
+    )
 
 
 def load_and_clean(csv_path: str, vocabs: dict = None):
