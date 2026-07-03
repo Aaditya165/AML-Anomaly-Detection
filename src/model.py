@@ -1,175 +1,345 @@
 """
 model.py
 --------
-PRD Section 6 (Embedding Strategy) + Section 10 (Graph Learning Architecture).
+Replaces the LineMVGNN. Three tree-based base learners over the exact
+same engineered feature set the GNN used (feature_columns.py), combined
+by a small logistic-regression stacker:
 
-`LineMVGNN` is not a published reference architecture with a fixed spec in
-the PRD beyond "learn transaction relationships and money-flow structures"
-plus the embedding strategy in Section 6, so it's implemented here as a
-**Multi-View** GNN operating on the transaction *line graph* described in
-Section 5, where each "view" corresponds to a distinct way of looking at a
-transaction node:
+    View A analogue - XGBoost        : gradient-boosted trees, the
+                                        workhorse model; strong on the
+                                        mixed numeric/categorical feature
+                                        set, native categorical support,
+                                        handles the extreme class
+                                        imbalance via scale_pos_weight.
+    View B analogue - LightGBM       : gradient-boosted trees with a
+                                        different (leaf-wise) growth
+                                        strategy and its own native
+                                        categorical splitting -- adds a
+                                        second, differently-biased
+                                        boosting model to the ensemble
+                                        rather than a second copy of
+                                        XGBoost's biases.
+    View C analogue - Random Forest  : bagged (not boosted) trees --
+                                        decorrelated error structure vs.
+                                        the two boosters, which is what
+                                        actually makes an ensemble worth
+                                        it rather than three votes for
+                                        the same mistakes.
 
-    View A - Structural view  : GATConv stack over the money-flow graph
-                                 (learns which predecessor transactions
-                                 matter most -- attention over flow).
-    View B - Account-context  : GCNConv stack over the same graph, applied
-                                 to a representation dominated by the
-                                 account/bank/currency embeddings (Section 6)
-                                 -- smooths account-behavioral signal across
-                                 connected transactions (pass-through,
-                                 layering chains).
-    View C - Attribute view   : graph-free MLP over the instantaneous
-                                 transaction attributes (amount, time,
-                                 payment format, ...) -- captures signal
-                                 that doesn't depend on graph context.
+Fusion analogue - Stacking: a LogisticRegression meta-learner is fit on
+the three base models' predicted probabilities on a held-out validation
+slice (never on data the base models trained on), the same anti-leakage
+principle behind every "prior-only" feature in feature_engineering.py.
 
-The three views are fused (concat + linear) into a single "Transaction
-Embedding" which then feeds the Section 10 classifier head:
-
-    Transaction Embedding -> Linear -> ReLU -> Dropout -> Linear -> Sigmoid
-
-(The final Sigmoid is applied outside the module via
-`torch.sigmoid(logits)` / `BCEWithLogitsLoss`, the numerically-stable
-standard equivalent -- the produced probability is identical.)
-
-If you have a specific published LineMVGNN paper/architecture in mind,
-swap this module out; everything downstream (training loop, NeighborLoader
-sampling, evaluation) is architecture-agnostic and only depends on the
-`forward(...) -> logits[N]` contract below.
+Why this is production-appropriate where the GNN wasn't:
+  - No graph batching / neighbor sampling at inference time -- scoring a
+    transaction is 3 tree lookups + a 3-input logistic regression, all
+    CPU, all sub-millisecond even at high volume.
+  - No custom PyG plumbing to keep in sync with library versions
+    (`neighbor_sampling.py` existed specifically because pyg-lib/
+    torch-sparse wheels were unreliable -- that whole failure mode is
+    gone).
+  - Model artifacts are a handful of small files (`joblib.dump`), easy to
+    version, diff, and roll back -- vs. a state_dict tied to an exact
+    architecture definition.
+  - Every base learner exposes native feature importances, which matters
+    for AML specifically: investigators and regulators expect to know
+    *why* a transaction was flagged, not just that a black-box embedding
+    said so.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GCNConv
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+
+import lightgbm as lgb
+import xgboost as xgb
+
+from .feature_columns import (
+    NUMERIC_FEATURE_COLUMNS,
+    CATEGORICAL_FEATURE_COLUMNS,
+    ALL_FEATURE_COLUMNS,
+    prepare_feature_frame,
+)
+
+DEFAULT_XGB_PARAMS = dict(
+    n_estimators=600,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_weight=2,
+    reg_lambda=1.0,
+    tree_method="hist",
+    enable_categorical=True,
+    eval_metric="aucpr",
+    n_jobs=-1,
+    random_state=0,
+)
+
+DEFAULT_LGB_PARAMS = dict(
+    n_estimators=600,
+    num_leaves=63,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_samples=20,
+    reg_lambda=1.0,
+    objective="binary",
+    metric="average_precision",
+    n_jobs=-1,
+    random_state=0,
+    verbosity=-1,
+)
+
+DEFAULT_RF_PARAMS = dict(
+    n_estimators=400,
+    max_depth=14,
+    min_samples_leaf=5,
+    max_features="sqrt",
+    class_weight="balanced_subsample",
+    n_jobs=-1,
+    random_state=0,
+)
 
 
-class LineMVGNN(nn.Module):
-    def __init__(
-        self,
-        numeric_dim: int,
-        #n_accounts: int,
-        #n_banks: int,
-        n_payment_formats: int,
-        n_currencies: int,
-        emb_dim: int = 16,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        gat_heads: int = 4,
-        dropout: float = 0.3,
-    ):
-        super().__init__()
-        half = max(emb_dim // 2, 4)
+def _scale_pos_weight(y: np.ndarray) -> float:
+    n_pos = float((y == 1).sum())
+    n_neg = float((y == 0).sum())
+    return max(n_neg, 1.0) / max(n_pos, 1.0)
 
-        # ---- Section 6: learnable categorical embeddings ----
-        # self.account_emb = nn.Embedding(n_accounts, emb_dim)        # sender & receiver share this table
-        # self.bank_emb = nn.Embedding(n_banks, half)                 # from & to bank share this table
-        self.payfmt_emb = nn.Embedding(n_payment_formats, half)
-        self.currency_emb = nn.Embedding(n_currencies, half)        # payment & receiving currency share this table
 
-        embed_total_dim = (
-            half + #payment format
-            half + #payment currency
-            half #receiving currency
+@dataclass
+class AMLEnsemble:
+    """
+    Usage:
+        ens = AMLEnsemble()
+        ens.fit(df_train, df_val)          # df_* need a "label" column +
+                                            # every column in ALL_FEATURE_COLUMNS
+        probs = ens.predict_proba(df_test)
+        ens.save("cache/ensemble")
+        ens2 = AMLEnsemble.load("cache/ensemble")
+    """
+
+    xgb_params: dict = field(default_factory=lambda: dict(DEFAULT_XGB_PARAMS))
+    lgb_params: dict = field(default_factory=lambda: dict(DEFAULT_LGB_PARAMS))
+    rf_params: dict = field(default_factory=lambda: dict(DEFAULT_RF_PARAMS))
+    early_stopping_rounds: int = 40
+
+    def __post_init__(self):
+        self.xgb_model_: xgb.XGBClassifier | None = None
+        self.lgb_model_: lgb.LGBMClassifier | None = None
+        self.rf_model_: RandomForestClassifier | None = None
+        self.stacker_: LogisticRegression | None = None
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+    def fit(self, df_train: pd.DataFrame, df_val: pd.DataFrame, label_col: str = "label"):
+        y_train = df_train[label_col].values.astype(np.int32)
+        y_val = df_val[label_col].values.astype(np.int32)
+
+        X_train = prepare_feature_frame(df_train)
+        X_val = prepare_feature_frame(df_val)
+
+        spw = _scale_pos_weight(y_train)
+        print(f"scale_pos_weight (train): {spw:.2f} "
+              f"({int((y_train == 1).sum())} positive / {int((y_train == 0).sum())} negative)")
+
+        # ---- XGBoost (native pandas categorical dtype support) ----
+        self.xgb_model_ = xgb.XGBClassifier(
+            **self.xgb_params,
+            scale_pos_weight=spw,
+            early_stopping_rounds=self.early_stopping_rounds,
         )
-        self.input_proj = nn.Linear(numeric_dim + embed_total_dim, hidden_dim)
+        self.xgb_model_.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
+        print(f"XGBoost: best_iteration={self.xgb_model_.best_iteration}, "
+              f"best val PR-AUC={self.xgb_model_.best_score:.4f}")
 
-        # ---- View A: structural / topology (attention over money flow) ----
-        self.gat_layers = nn.ModuleList([
-            GATConv(hidden_dim, hidden_dim // gat_heads, heads=gat_heads,
-                    concat=True, dropout=dropout)
-            for _ in range(num_layers)
-        ])
+        # ---- LightGBM (native categorical via pandas 'category' dtype) ----
+        self.lgb_model_ = lgb.LGBMClassifier(**self.lgb_params, scale_pos_weight=spw)
+        self.lgb_model_.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            categorical_feature=CATEGORICAL_FEATURE_COLUMNS,
+            callbacks=[lgb.early_stopping(self.early_stopping_rounds, verbose=False)],
+        )
+        print(f"LightGBM: best_iteration={self.lgb_model_.best_iteration_}, "
+              f"best val PR-AUC={self.lgb_model_.best_score_['valid_0']['average_precision']:.4f}")
 
-        # ---- View B: account-context (smoothing over the flow graph) ----
-        self.gcn_layers = nn.ModuleList([
-            GCNConv(hidden_dim, hidden_dim) for _ in range(num_layers)
-        ])
+        # ---- Random Forest (bagged, decorrelated w.r.t. the two boosters).
+        # Categorical columns go in as their existing ordinal integer codes
+        # -- sklearn's RandomForestClassifier has no native categorical
+        # split type, and one-hot-ing bank IDs would blow up the column
+        # count for a single ensemble member whose whole job is just to
+        # be a differently-biased vote. Numeric features are identical to
+        # the other two models. ----
+        X_train_rf = X_train.copy()
+        X_val_rf = X_val.copy()
+        for c in CATEGORICAL_FEATURE_COLUMNS:
+            X_train_rf[c] = X_train_rf[c].cat.codes
+            X_val_rf[c] = X_val_rf[c].cat.codes
+        self.rf_model_ = RandomForestClassifier(**self.rf_params)
+        self.rf_model_.fit(X_train_rf, y_train)
 
-        # ---- View C: transaction-attribute view (graph-free) ----
-        self.attr_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        # ---- Stack: fit a tiny logistic regression on VAL-set base
+        # predictions only, so the meta-learner never sees predictions
+        # made on rows the base models were themselves trained on. ----
+        base_val_probs = self._base_probs(df_val, X_val=X_val, X_val_rf=X_val_rf)
+        self.stacker_ = LogisticRegression(class_weight="balanced", max_iter=1000)
+        self.stacker_.fit(base_val_probs, y_val)
+
+        val_probs = self.stacker_.predict_proba(base_val_probs)[:, 1]
+        print("Stacker coefficients [xgb, lgb, rf]:", np.round(self.stacker_.coef_[0], 3))
+        return self, val_probs
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+    def _base_probs(self, df: pd.DataFrame, X_val=None, X_val_rf=None) -> np.ndarray:
+        X = X_val if X_val is not None else prepare_feature_frame(df)
+        if X_val_rf is not None:
+            X_rf = X_val_rf
+        else:
+            X_rf = X.copy()
+            for c in CATEGORICAL_FEATURE_COLUMNS:
+                X_rf[c] = X_rf[c].cat.codes
+
+        p_xgb = self.xgb_model_.predict_proba(X)[:, 1]
+        p_lgb = self.lgb_model_.predict_proba(X)[:, 1]
+        p_rf = self.rf_model_.predict_proba(X_rf)[:, 1]
+        return np.column_stack([p_xgb, p_lgb, p_rf])
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        """Full ensemble probability, aligned to df's row order."""
+        base_probs = self._base_probs(df)
+        return self.stacker_.predict_proba(base_probs)[:, 1]
+
+    def predict_proba_by_model(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Per-base-model probabilities, useful for the dashboard / debugging
+        disagreement between the boosted and bagged views."""
+        base_probs = self._base_probs(df)
+        stacked = self.stacker_.predict_proba(base_probs)[:, 1]
+        return pd.DataFrame({
+            "xgboost": base_probs[:, 0],
+            "lightgbm": base_probs[:, 1],
+            "random_forest": base_probs[:, 2],
+            "ensemble": stacked,
+        })
+
+    # ------------------------------------------------------------------
+    # Explainability
+    # ------------------------------------------------------------------
+    def feature_importance(self, top_n: int = 25) -> pd.DataFrame:
+        """
+        Gain-based importance from each booster (comparable across
+        features, unlike raw split counts) plus RF's impurity-based
+        importance, min-max normalized per model then averaged -- gives
+        investigators a single ranked driver list instead of three
+        disagreeing tables.
+        """
+        xgb_imp = pd.Series(
+            self.xgb_model_.get_booster().get_score(importance_type="gain"),
+        )
+        # XGBoost keys importances by internal feature names (f0, f1, ...)
+        # when a plain ndarray is used, but by real column names when a
+        # DataFrame with categorical dtype is used (our case) -- reindex
+        # defensively either way.
+        xgb_imp = xgb_imp.reindex(ALL_FEATURE_COLUMNS).fillna(0.0)
+
+        lgb_imp = pd.Series(
+            self.lgb_model_.booster_.feature_importance(importance_type="gain"),
+            index=self.lgb_model_.booster_.feature_name(),
+        ).reindex(ALL_FEATURE_COLUMNS).fillna(0.0)
+
+        rf_imp = pd.Series(
+            self.rf_model_.feature_importances_,
+            index=ALL_FEATURE_COLUMNS,
         )
 
-        self.fusion = nn.Linear(hidden_dim * 3, hidden_dim)
-        self.dropout = nn.Dropout(dropout)
+        def _norm(s: pd.Series) -> pd.Series:
+            rng = s.max() - s.min()
+            return (s - s.min()) / rng if rng > 0 else s * 0.0
 
-        # ---- Section 10: MLP classifier head ----
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
+        combined = pd.DataFrame({
+            "xgboost": _norm(xgb_imp),
+            "lightgbm": _norm(lgb_imp),
+            "random_forest": _norm(rf_imp),
+        })
+        combined["average"] = combined.mean(axis=1)
+        combined = combined.sort_values("average", ascending=False)
+        combined.index.name = "feature"
+        return combined.head(top_n).reset_index()
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def save(self, path: str) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(
+            {
+                "xgb_model": self.xgb_model_,
+                "lgb_model": self.lgb_model_,
+                "rf_model": self.rf_model_,
+                "stacker": self.stacker_,
+                "xgb_params": self.xgb_params,
+                "lgb_params": self.lgb_params,
+                "rf_params": self.rf_params,
+            },
+            path,
         )
 
-    def embed_categoricals(self, batch) -> torch.Tensor:
-        return torch.cat([
-            # self.account_emb(batch.sender_idx),
-            # self.account_emb(batch.receiver_idx),
-            # self.bank_emb(batch.from_bank_idx),
-            # self.bank_emb(batch.to_bank_idx),
-            self.payfmt_emb(batch.payment_format_idx),
-            self.currency_emb(batch.payment_currency_idx),
-            self.currency_emb(batch.receiving_currency_idx),
-        ], dim=-1)
-
-    def forward(self, batch) -> torch.Tensor:
-        """`batch` is a (sub)graph with .x, .edge_index, .<cat>_idx attrs.
-        Returns raw logits of shape [N] (apply torch.sigmoid for probability)."""
-        cat_emb = self.embed_categoricals(batch)
-        h0 = F.relu(self.input_proj(torch.cat([batch.x, cat_emb], dim=-1)))
-
-        h_struct = h0
-        for layer in self.gat_layers:
-            h_struct = F.relu(layer(h_struct, batch.edge_index))
-            h_struct = self.dropout(h_struct)
-
-        h_ctx = h0
-        for layer in self.gcn_layers:
-            h_ctx = F.relu(layer(h_ctx, batch.edge_index))
-            h_ctx = self.dropout(h_ctx)
-
-        h_attr = self.attr_mlp(h0)
-
-        fused = F.relu(self.fusion(torch.cat([h_struct, h_ctx, h_attr], dim=-1)))
-        fused = self.dropout(fused)
-
-        logits = self.classifier(fused).squeeze(-1)
-        return logits
+    @classmethod
+    def load(cls, path: str) -> "AMLEnsemble":
+        blob = joblib.load(path)
+        ens = cls(
+            xgb_params=blob["xgb_params"],
+            lgb_params=blob["lgb_params"],
+            rf_params=blob["rf_params"],
+        )
+        ens.xgb_model_ = blob["xgb_model"]
+        ens.lgb_model_ = blob["lgb_model"]
+        ens.rf_model_ = blob["rf_model"]
+        ens.stacker_ = blob["stacker"]
+        return ens
 
 
 if __name__ == "__main__":
-    from data_processing import load_and_clean, vocab_sizes
-    from graph_construction import build_transaction_graph
-    from feature_engineering import engineer_all_features
-    from pyg_export import build_pyg_data, NUMERIC_FEATURE_COLUMNS
-    from neighbor_sampling import SimpleNeighborLoader
+    # Lightweight self-test with synthetic data -- doesn't require the
+    # full data_processing/graph_construction/feature_engineering chain,
+    # just something shaped like their output.
+    rng = np.random.default_rng(0)
+    n = 20_000
+    df = pd.DataFrame({c: rng.normal(size=n) for c in NUMERIC_FEATURE_COLUMNS})
+    df["from_bank_idx"] = rng.integers(0, 50, size=n)
+    df["to_bank_idx"] = rng.integers(0, 50, size=n)
+    df["payment_format_idx"] = rng.integers(0, 6, size=n)
+    df["payment_currency_idx"] = rng.integers(0, 10, size=n)
+    df["receiving_currency_idx"] = rng.integers(0, 10, size=n)
+    signal = df["relay_timing_score"] + df["short_cycle_participation"] * 2 - df["sender_entropy"]
+    prob = 1 / (1 + np.exp(-(signal - signal.mean())))
+    df["label"] = (rng.random(n) < (prob * 0.05)).astype(int)
 
-    df, vocabs = load_and_clean("HI-Small_Trans_SYNTHETIC.csv")
-    g, src, dst, preds, succs = build_transaction_graph(df)
-    df = engineer_all_features(df, preds, succs, src, dst)
-    data, scaler = build_pyg_data(df, src, dst, fit_scaler=True)
-    vs = vocab_sizes(vocabs)
+    split = int(n * 0.8)
+    df_train, df_val = df.iloc[:split], df.iloc[split:]
 
-    model = LineMVGNN(
-        numeric_dim=len(NUMERIC_FEATURE_COLUMNS),
-        n_accounts=vs["n_accounts"], n_banks=vs["n_banks"],
-        n_payment_formats=vs["n_payment_formats"], n_currencies=vs["n_currencies"],
-    )
-    print(model)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Total trainable parameters: {n_params:,}")
+    ens = AMLEnsemble()
+    ens, val_probs = ens.fit(df_train, df_val)
+    print("val probs range:", val_probs.min(), val_probs.max())
+    print(ens.feature_importance(10))
 
-    loader = SimpleNeighborLoader(
-        data, preds,
-        num_neighbors=[15,10],
-        input_nodes=torch.arange(data.num_nodes),
-        batch_size=256,
-    )
-    batch = next(iter(loader))
-    logits = model(batch)
-    print("logits shape:", logits.shape, "seed_size:", batch.seed_size)
-    probs = torch.sigmoid(logits[:batch.seed_size])
-    print("sample probabilities:", probs[:5])
+    ens.save("/tmp/ensemble_smoketest.joblib")
+    reloaded = AMLEnsemble.load("/tmp/ensemble_smoketest.joblib")
+    reloaded_probs = reloaded.predict_proba(df_val)
+    print("max abs diff after reload:", np.abs(val_probs - reloaded_probs).max())
+    print("OK")

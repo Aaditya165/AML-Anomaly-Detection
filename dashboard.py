@@ -2,15 +2,19 @@
 dashboard.py
 ------------
 PRD Section 16: Dashboard Requirements (Transaction View, Account View).
+Plus a Model Insights tab that the GNN version didn't have -- gradient-
+boosted trees expose native feature importance, which is exactly the
+kind of "why was this flagged" answer AML investigators/regulators need
+and a GNN's learned embeddings don't give you for free.
 
 Run with:
     streamlit run dashboard.py
 
-Reads the CSV/JSON artifacts produced at the end of the training notebook:
-    transaction_view.csv   (Transaction ID, Risk Score, Sender, Receiver, Amount, Timestamp)
-    account_view.csv       (Account ID, Associated Risk Score, Number of Flagged
-                             Transactions, Counterparty Summary)
-    timing_log.json        (per-stage pipeline timings, from timing_utils.save_timing_log)
+Reads the CSV artifacts produced at the end of the training notebook:
+    transaction_view.csv     (Transaction ID, Risk Score, Sender, Receiver, Amount, Timestamp)
+    account_view.csv         (Account ID, Associated Risk Score, Number of Flagged
+                               Transactions, Counterparty Summary)
+    feature_importance.csv   (feature, xgboost, lightgbm, random_forest, average)
 
 If those files aren't found next to this script, the sidebar lets you
 point at different paths (e.g. if you copied them elsewhere).
@@ -24,13 +28,14 @@ import streamlit as st
 
 st.set_page_config(page_title="AML Transaction-Graph Dashboard", layout="wide")
 
-st.title("Graph-Based AML Detection Dashboard")
-st.caption("Transaction-level LineMVGNN risk scores, account roll-ups, and pipeline timing.")
+st.title("AML Detection Dashboard - XGBoost / LightGBM / Random Forest Ensemble")
+st.caption("Transaction-level ensemble risk scores, account roll-ups, and model drivers.")
 
 with st.sidebar:
     st.header("Data sources")
     txn_path = st.text_input("Transaction view CSV", "transaction_view.csv")
     acct_path = st.text_input("Account view CSV", "account_view.csv")
+    importance_path = st.text_input("Feature importance CSV", "feature_importance.csv")
     st.divider()
     risk_threshold = st.slider("Risk score threshold", 0.0, 1.0, 0.5, 0.01)
 
@@ -43,7 +48,7 @@ def _load_csv(path, label):
     return pd.read_csv(path)
 
 
-tab_txn, tab_acct = st.tabs(["Transaction View", "Account View"])
+tab_txn, tab_acct, tab_model = st.tabs(["Transaction View", "Account View", "Model Insights"])
 
 # --------------------------------------------------------------------------
 # Transaction View (PRD 16): Transaction ID, Risk Score, Sender, Receiver,
@@ -98,4 +103,36 @@ with tab_acct:
             )
             st.plotly_chart(fig, use_container_width=True)
 
+# --------------------------------------------------------------------------
+# Model Insights (new): which features are actually driving the ensemble's
+# score, per base model and on average. Trees give this for free at
+# inference time; the GNN's learned embeddings didn't expose an
+# equivalent without extra post-hoc explainability work.
+# --------------------------------------------------------------------------
+with tab_model:
+    df_imp = _load_csv(importance_path, "feature importance")
+    if df_imp is not None:
+        st.subheader("Top feature drivers (gain-based, normalized 0-1 per model)")
+        st.caption(
+            "Averaged across the three base learners so a feature that only one "
+            "model likes doesn't dominate the ranking. High-cardinality account "
+            "identity is deliberately excluded from the model -- see feature_columns.py."
+        )
+        fig = px.bar(
+            df_imp.sort_values("average", ascending=True),
+            x="average", y="feature", orientation="h",
+            title="Average feature importance across XGBoost / LightGBM / Random Forest",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
+        st.subheader("Per-model breakdown")
+        melted = df_imp.melt(
+            id_vars="feature", value_vars=["xgboost", "lightgbm", "random_forest"],
+            var_name="model", value_name="importance",
+        )
+        fig2 = px.bar(
+            melted, x="feature", y="importance", color="model", barmode="group",
+            title="Feature importance by base model",
+        )
+        fig2.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig2, use_container_width=True)

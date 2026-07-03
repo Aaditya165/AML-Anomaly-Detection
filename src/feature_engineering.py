@@ -399,7 +399,7 @@ if __name__ == "__main__":
     from data_processing import load_and_clean
     from graph_construction import build_transaction_graph
 
-    df, vocabs = load_and_clean("HI-Small_Trans_SYNTHETIC.csv")
+    df, vocabs = load_and_clean("data/HI-Small_Trans.csv")
     g, src, dst, preds, succs = build_transaction_graph(df)
     df = engineer_all_features(df, preds, succs, src, dst)
     print(df.shape)

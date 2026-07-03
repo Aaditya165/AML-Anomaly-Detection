@@ -205,7 +205,7 @@ def build_transaction_graph(df: pd.DataFrame):
 
 if __name__ == "__main__":
     from data_processing import load_and_clean
-    df, vocabs = load_and_clean("HI-Small_Trans.csv")
+    df, vocabs = load_and_clean("data/HI-Small_Trans.csv")
     g, src, dst, preds, succs = build_transaction_graph(df)
     print("nodes:", g.numberOfNodes(), "edges:", g.numberOfEdges())
     print("avg out-degree:", src.shape[0] / g.numberOfNodes())
