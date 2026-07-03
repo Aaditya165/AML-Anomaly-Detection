@@ -54,7 +54,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from sklearn.linear_model import LogisticRegression
 
 import lightgbm as lgb
@@ -68,14 +68,16 @@ from .feature_columns import (
 )
 
 DEFAULT_XGB_PARAMS = dict(
-    n_estimators=600,
-    max_depth=6,
-    learning_rate=0.05,
+    n_estimators=1200,
+    max_depth=7,
+    learning_rate=0.03,
     subsample=0.8,
     colsample_bytree=0.8,
     min_child_weight=2,
     reg_lambda=1.0,
+    max_delta_step=1,       # stabilizes logistic loss under extreme imbalance
     tree_method="hist",
+    device="cuda",          # GPU — remove this line to fall back to CPU
     enable_categorical=True,
     eval_metric="aucpr",
     n_jobs=-1,
@@ -83,26 +85,52 @@ DEFAULT_XGB_PARAMS = dict(
 )
 
 DEFAULT_LGB_PARAMS = dict(
-    n_estimators=600,
-    num_leaves=63,
-    learning_rate=0.05,
+    n_estimators=2000,
+    num_leaves=31,
+    learning_rate=0.02,
     subsample=0.8,
+    subsample_freq=1,
     colsample_bytree=0.8,
-    min_child_samples=20,
-    reg_lambda=1.0,
+    min_child_samples=50,
+    min_child_weight=1e-3,
+    reg_lambda=5.0,
+    reg_alpha=1.0,
     objective="binary",
     metric="average_precision",
+    device="gpu",            # see caveat below before enabling
     n_jobs=-1,
     random_state=0,
     verbosity=-1,
 )
 
+LGB_MAX_SCALE_POS_WEIGHT = 50.0
+
+"""
+Caveat on device="gpu": 
+unlike XGBoost, LightGBM's default PyPI wheel is often CPU-only — 
+GPU support usually needs a build with --config-setting=cmake.define.USE_GPU=ON 
+or a conda-forge GPU build. Test it first:
+import lightgbm as lgb
+lgb.LGBMClassifier(device="gpu").fit([[1,2],[3,4]], [0,1])
+If that raises something like "GPU Tree Learner was not enabled in this build", 
+delete the device="gpu" line and stay CPU for LightGBM 
+— it's a much smaller cost than RF anyway.
+"""
+
 DEFAULT_RF_PARAMS = dict(
-    n_estimators=400,
-    max_depth=14,
-    min_samples_leaf=5,
+    n_estimators=600,
+    max_depth=18,
+    min_samples_leaf=3,
     max_features="sqrt",
     class_weight="balanced_subsample",
+    n_jobs=-1,
+    random_state=0,
+)
+
+DEFAULT_ISO_PARAMS = dict(
+    n_estimators=200,
+    max_samples="auto",
+    contamination="auto",
     n_jobs=-1,
     random_state=0,
 )
@@ -129,12 +157,16 @@ class AMLEnsemble:
     xgb_params: dict = field(default_factory=lambda: dict(DEFAULT_XGB_PARAMS))
     lgb_params: dict = field(default_factory=lambda: dict(DEFAULT_LGB_PARAMS))
     rf_params: dict = field(default_factory=lambda: dict(DEFAULT_RF_PARAMS))
+    iso_params: dict = field(default_factory=lambda: dict(DEFAULT_ISO_PARAMS))
     early_stopping_rounds: int = 40
 
     def __post_init__(self):
         self.xgb_model_: xgb.XGBClassifier | None = None
         self.lgb_model_: lgb.LGBMClassifier | None = None
         self.rf_model_: RandomForestClassifier | None = None
+        self.iso_model_: IsolationForest | None = None
+        self.iso_score_min_: float | None = None
+        self.iso_score_max_: float | None = None
         self.stacker_: LogisticRegression | None = None
 
     # ------------------------------------------------------------------
@@ -191,6 +223,19 @@ class AMLEnsemble:
         self.rf_model_ = RandomForestClassifier(**self.rf_params)
         self.rf_model_.fit(X_train_rf, y_train)
 
+        # ---- Isolation Forest (unsupervised anomaly score, 4th view) ----
+        self.iso_model_ = IsolationForest(**self.iso_params)
+        self.iso_model_.fit(X_train[NUMERIC_FEATURE_COLUMNS])
+
+        # decision_function is HIGH for normal points, LOW for anomalies --
+        # flip sign so higher = more anomalous. Bounds are fixed from TRAIN
+        # here and reused at inference (not recomputed per batch) -- doing
+        # it per-batch would make a single-row production score always
+        # normalize to 0.
+        iso_raw_train = -self.iso_model_.decision_function(X_train[NUMERIC_FEATURE_COLUMNS])
+        self.iso_score_min_ = float(iso_raw_train.min())
+        self.iso_score_max_ = float(iso_raw_train.max())
+
         # ---- Stack: fit a tiny logistic regression on VAL-set base
         # predictions only, so the meta-learner never sees predictions
         # made on rows the base models were themselves trained on. ----
@@ -199,7 +244,7 @@ class AMLEnsemble:
         self.stacker_.fit(base_val_probs, y_val)
 
         val_probs = self.stacker_.predict_proba(base_val_probs)[:, 1]
-        print("Stacker coefficients [xgb, lgb, rf]:", np.round(self.stacker_.coef_[0], 3))
+        print("Stacker coefficients [xgb, lgb, rf, iso_forest]:", np.round(self.stacker_.coef_[0], 3))
         return self, val_probs
 
     # ------------------------------------------------------------------
@@ -217,7 +262,12 @@ class AMLEnsemble:
         p_xgb = self.xgb_model_.predict_proba(X)[:, 1]
         p_lgb = self.lgb_model_.predict_proba(X)[:, 1]
         p_rf = self.rf_model_.predict_proba(X_rf)[:, 1]
-        return np.column_stack([p_xgb, p_lgb, p_rf])
+
+        iso_raw = -self.iso_model_.decision_function(X[NUMERIC_FEATURE_COLUMNS])
+        iso_clipped = np.clip(iso_raw, self.iso_score_min_, self.iso_score_max_)
+        iso_score = (iso_clipped - self.iso_score_min_) / (self.iso_score_max_ - self.iso_score_min_ + 1e-9)
+
+        return np.column_stack([p_xgb, p_lgb, p_rf, iso_score])
 
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
         """Full ensemble probability, aligned to df's row order."""
@@ -233,6 +283,7 @@ class AMLEnsemble:
             "xgboost": base_probs[:, 0],
             "lightgbm": base_probs[:, 1],
             "random_forest": base_probs[:, 2],
+            "isolation_forest_anomaly": base_probs[:, 3],
             "ensemble": stacked,
         })
 
@@ -291,10 +342,14 @@ class AMLEnsemble:
                 "xgb_model": self.xgb_model_,
                 "lgb_model": self.lgb_model_,
                 "rf_model": self.rf_model_,
+                "iso_model": self.iso_model_,
+                "iso_score_min": self.iso_score_min_,
+                "iso_score_max": self.iso_score_max_,
                 "stacker": self.stacker_,
                 "xgb_params": self.xgb_params,
                 "lgb_params": self.lgb_params,
                 "rf_params": self.rf_params,
+                "iso_params": self.iso_params,
             },
             path,
         )
@@ -306,10 +361,14 @@ class AMLEnsemble:
             xgb_params=blob["xgb_params"],
             lgb_params=blob["lgb_params"],
             rf_params=blob["rf_params"],
+            iso_params=blob["iso_params"],
         )
         ens.xgb_model_ = blob["xgb_model"]
         ens.lgb_model_ = blob["lgb_model"]
         ens.rf_model_ = blob["rf_model"]
+        ens.iso_model_ = blob["iso_model"]
+        ens.iso_score_min_ = blob["iso_score_min"]
+        ens.iso_score_max_ = blob["iso_score_max"]
         ens.stacker_ = blob["stacker"]
         return ens
 
