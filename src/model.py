@@ -60,7 +60,7 @@ from sklearn.linear_model import LogisticRegression
 import lightgbm as lgb
 import xgboost as xgb
 
-from feature_columns import (
+from .feature_columns import (
     NUMERIC_FEATURE_COLUMNS,
     CATEGORICAL_FEATURE_COLUMNS,
     ALL_FEATURE_COLUMNS,
