@@ -60,7 +60,7 @@ from sklearn.linear_model import LogisticRegression
 import lightgbm as lgb
 import xgboost as xgb
 
-from .feature_columns import (
+from feature_columns import (
     NUMERIC_FEATURE_COLUMNS,
     CATEGORICAL_FEATURE_COLUMNS,
     ALL_FEATURE_COLUMNS,
@@ -73,11 +73,11 @@ DEFAULT_XGB_PARAMS = dict(
     learning_rate=0.03,
     subsample=0.8,
     colsample_bytree=0.8,
+    colsample_bynode=0.8,
     min_child_weight=2,
     reg_lambda=1.0,
-    max_delta_step=1,       # stabilizes logistic loss under extreme imbalance
+    max_delta_step=1,
     tree_method="hist",
-    device="cuda",          # GPU — remove this line to fall back to CPU
     enable_categorical=True,
     eval_metric="aucpr",
     n_jobs=-1,
@@ -97,25 +97,19 @@ DEFAULT_LGB_PARAMS = dict(
     reg_alpha=1.0,
     objective="binary",
     metric="average_precision",
-    device="cpu",            # see caveat below before enabling
     n_jobs=-1,
     random_state=0,
     verbosity=-1,
 )
 
+# LightGBM's leaf-wise growth reacts much more violently to a large
+# scale_pos_weight than XGBoost's level-wise growth does -- at extreme
+# imbalance (~1000:1 here) a single early tree can overshoot so hard that
+# early stopping fires almost immediately (this is what "best_iteration=1"
+# means). Cap what we pass in rather than handing it the raw ratio, and
+# rely on the much lower learning_rate above + higher min_child_samples
+# to keep boosting rounds stable instead.
 LGB_MAX_SCALE_POS_WEIGHT = 50.0
-
-"""
-Caveat on device="gpu": 
-unlike XGBoost, LightGBM's default PyPI wheel is often CPU-only — 
-GPU support usually needs a build with --config-setting=cmake.define.USE_GPU=ON 
-or a conda-forge GPU build. Test it first:
-import lightgbm as lgb
-lgb.LGBMClassifier(device="gpu").fit([[1,2],[3,4]], [0,1])
-If that raises something like "GPU Tree Learner was not enabled in this build", 
-delete the device="gpu" line and stay CPU for LightGBM 
-— it's a much smaller cost than RF anyway.
-"""
 
 DEFAULT_RF_PARAMS = dict(
     n_estimators=600,
@@ -140,6 +134,24 @@ def _scale_pos_weight(y: np.ndarray) -> float:
     n_pos = float((y == 1).sum())
     n_neg = float((y == 0).sum())
     return max(n_neg, 1.0) / max(n_pos, 1.0)
+
+
+# Per-feature sampling weight for XGBoost's colsample_bytree/colsample_bynode
+# (used via the `feature_weights` fit() argument). 1.0 = normal sampling odds
+# for every feature except the ones listed, which get sampled into fewer
+# trees/splits -- diluting their influence WITHOUT removing them, unlike
+# dropping the column entirely (which the payment-format ablation showed
+# costs ~40% of ensemble PR-AUC on this dataset). Tune the value, not just
+# on/off: lower = more diluted. This only affects XGBoost -- LightGBM has no
+# directly equivalent per-feature sampling-weight knob, and Random Forest's
+# max_features is already a blunt, not-per-feature, form of the same idea.
+FEATURE_WEIGHT_OVERRIDES = {
+    "payment_format_idx": 0.1,
+}
+
+
+def _xgb_feature_weights(columns) -> np.ndarray:
+    return np.array([FEATURE_WEIGHT_OVERRIDES.get(c, 1.0) for c in columns], dtype=np.float32)
 
 
 @dataclass
@@ -188,6 +200,7 @@ class AMLEnsemble:
             **self.xgb_params,
             scale_pos_weight=spw,
             early_stopping_rounds=self.early_stopping_rounds,
+            feature_weights=_xgb_feature_weights(ALL_FEATURE_COLUMNS),
         )
         self.xgb_model_.fit(
             X_train, y_train,
@@ -198,12 +211,18 @@ class AMLEnsemble:
               f"best val PR-AUC={self.xgb_model_.best_score:.4f}")
 
         # ---- LightGBM (native categorical via pandas 'category' dtype) ----
-        self.lgb_model_ = lgb.LGBMClassifier(**self.lgb_params, scale_pos_weight=spw)
+        # Capped rather than the raw ~1000:1 ratio -- see the comment above
+        # LGB_MAX_SCALE_POS_WEIGHT for why the raw ratio makes LightGBM's
+        # leaf-wise boosting overshoot and stop after 1 round.
+        lgb_spw = min(spw, LGB_MAX_SCALE_POS_WEIGHT)
+        if lgb_spw < spw:
+            print(f"LightGBM scale_pos_weight capped: {spw:.1f} -> {lgb_spw:.1f}")
+        self.lgb_model_ = lgb.LGBMClassifier(**self.lgb_params, scale_pos_weight=lgb_spw)
         self.lgb_model_.fit(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
             categorical_feature=CATEGORICAL_FEATURE_COLUMNS,
-            callbacks=[lgb.early_stopping(self.early_stopping_rounds, verbose=False)],
+            callbacks=[lgb.early_stopping(max(self.early_stopping_rounds, 100), verbose=False)],
         )
         print(f"LightGBM: best_iteration={self.lgb_model_.best_iteration_}, "
               f"best val PR-AUC={self.lgb_model_.best_score_['valid_0']['average_precision']:.4f}")
@@ -223,15 +242,20 @@ class AMLEnsemble:
         self.rf_model_ = RandomForestClassifier(**self.rf_params)
         self.rf_model_.fit(X_train_rf, y_train)
 
-        # ---- Isolation Forest (unsupervised anomaly score, 4th view) ----
+        # ---- Isolation Forest (unsupervised anomaly score, 4th view).
+        # Fit on numeric features only -- it isolates outliers via random
+        # recursive partitioning and never looks at `label`, so it can in
+        # principle score transactions as anomalous even for laundering
+        # *patterns* the 3660 labeled positives never covered. ----
         self.iso_model_ = IsolationForest(**self.iso_params)
         self.iso_model_.fit(X_train[NUMERIC_FEATURE_COLUMNS])
 
         # decision_function is HIGH for normal points, LOW for anomalies --
-        # flip sign so higher = more anomalous. Bounds are fixed from TRAIN
-        # here and reused at inference (not recomputed per batch) -- doing
-        # it per-batch would make a single-row production score always
-        # normalize to 0.
+        # flip sign so higher = more anomalous, matching the other three
+        # columns where higher = more suspicious. The min/max used to
+        # rescale to ~[0, 1] are fixed here from the TRAIN distribution and
+        # reused (not recomputed) at inference -- recomputing per batch
+        # would make a single-row production score always normalize to 0.
         iso_raw_train = -self.iso_model_.decision_function(X_train[NUMERIC_FEATURE_COLUMNS])
         self.iso_score_min_ = float(iso_raw_train.min())
         self.iso_score_max_ = float(iso_raw_train.max())
