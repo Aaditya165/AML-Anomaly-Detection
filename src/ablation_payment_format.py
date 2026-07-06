@@ -25,10 +25,10 @@ notebook's feature-engineering cell, or as a separate script):
 import numpy as np
 import pandas as pd
 
-import feature_columns
-import model as model_module
-from model import AMLEnsemble
-from train import chronological_split, find_optimal_threshold, compute_classification_metrics, print_metrics_report
+from . import feature_columns
+from . import model as model_module
+from .model import AMLEnsemble
+from .train import chronological_split, find_optimal_threshold, compute_classification_metrics, print_metrics_report
 
 
 def _patch_feature_columns(exclude: list):
