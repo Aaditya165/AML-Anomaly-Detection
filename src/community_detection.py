@@ -34,7 +34,7 @@ import igraph as ig
 import leidenalg as la
 from joblib import Parallel, delayed
 
-import config
+from . import config
 
 
 # ---------------------------------------------------------------------------

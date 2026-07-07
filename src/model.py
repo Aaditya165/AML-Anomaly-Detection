@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-import config
+from . import config
 
 
 class Model:

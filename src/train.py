@@ -23,8 +23,8 @@ from sklearn.metrics import (
     average_precision_score, confusion_matrix, precision_recall_curve,
 )
 from pathlib import Path
-import feature_merge as fm
-from model import Model
+from . import feature_merge as fm
+from .model import Model
 
 
 def chronological_split(df: pd.DataFrame, val_frac: float = 0.15):

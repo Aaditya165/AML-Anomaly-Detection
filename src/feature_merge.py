@@ -31,11 +31,11 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from pathlib import Path
-import config
-import utils
-from graph_construction import build_account_graph
-import community_detection as cd
-import flow_features as ff
+from . import config
+from . import utils
+from .graph_construction import build_account_graph
+from . import community_detection as cd
+from . import flow_features as ff
 
 
 # ---------------------------------------------------------------------------
