@@ -195,9 +195,6 @@ def vocab_sizes(vocabs: dict) -> dict:
 
 
 if __name__ == "__main__":
-    from synthetic_data import generate_synthetic_transactions
-    raw = generate_synthetic_transactions()
-    raw.to_csv("HI-Small_Trans_SYNTHETIC.csv", index=False)
-    clean, vocabs = load_and_clean("HI-Small_Trans_SYNTHETIC.csv")
+    clean, vocabs = load_and_clean("HI-Small_Trans.csv")
     print(clean.shape)
     print(vocab_sizes(vocabs))

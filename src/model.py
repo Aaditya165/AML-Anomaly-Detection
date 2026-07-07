@@ -1,175 +1,113 @@
 """
 model.py
 --------
-PRD Section 6 (Embedding Strategy) + Section 10 (Graph Learning Architecture).
+Only the model definition. XGBoost only, to start (per the paper's own
+`ibm/training.ipynb` and Section 1's "sheer simplicity" as a stated
+design goal, not a corner cut -- Table 4's ablation shows the lift comes
+from the features, not from stacking learners on top of them). LightGBM /
+CatBoost / an ensemble are a straightforward later addition if a genuine
+apples-to-apples comparison shows they're worth the extra complexity --
+see README.md's ablation instructions.
 
-`LineMVGNN` is not a published reference architecture with a fixed spec in
-the PRD beyond "learn transaction relationships and money-flow structures"
-plus the embedding strategy in Section 6, so it's implemented here as a
-**Multi-View** GNN operating on the transaction *line graph* described in
-Section 5, where each "view" corresponds to a distinct way of looking at a
-transaction node:
+`num_parallel_tree=10` makes each boosting round grow 10 trees instead of
+1 -- a "boosted random forest" hybrid -- which is where a good chunk of
+variance reduction comes from without a separate Random Forest.
 
-    View A - Structural view  : GATConv stack over the money-flow graph
-                                 (learns which predecessor transactions
-                                 matter most -- attention over flow).
-    View B - Account-context  : GCNConv stack over the same graph, applied
-                                 to a representation dominated by the
-                                 account/bank/currency embeddings (Section 6)
-                                 -- smooths account-behavioral signal across
-                                 connected transactions (pass-through,
-                                 layering chains).
-    View C - Attribute view   : graph-free MLP over the instantaneous
-                                 transaction attributes (amount, time,
-                                 payment format, ...) -- captures signal
-                                 that doesn't depend on graph context.
-
-The three views are fused (concat + linear) into a single "Transaction
-Embedding" which then feeds the Section 10 classifier head:
-
-    Transaction Embedding -> Linear -> ReLU -> Dropout -> Linear -> Sigmoid
-
-(The final Sigmoid is applied outside the module via
-`torch.sigmoid(logits)` / `BCEWithLogitsLoss`, the numerically-stable
-standard equivalent -- the produced probability is identical.)
-
-If you have a specific published LineMVGNN paper/architecture in mind,
-swap this module out; everything downstream (training loop, NeighborLoader
-sampling, evaluation) is architecture-agnostic and only depends on the
-`forward(...) -> logits[N]` contract below.
+Expects categorical columns already cast to pandas `category` dtype
+(feature_merge.prepare_feature_frame does this) -- native
+`enable_categorical=True`, no one-hot, no separate encoder to version.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GCNConv
+import json
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+
+import config
 
 
-class LineMVGNN(nn.Module):
+class Model:
+    """Thin, save/load-able wrapper around one xgboost.Booster."""
+
     def __init__(
         self,
-        numeric_dim: int,
-        #n_accounts: int,
-        #n_banks: int,
-        n_payment_formats: int,
-        n_currencies: int,
-        emb_dim: int = 16,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        gat_heads: int = 4,
-        dropout: float = 0.3,
+        params: Optional[dict] = None,
+        num_boost_round: int = config.XGB_NUM_BOOST_ROUND,
+        early_stopping_rounds: int = config.XGB_EARLY_STOPPING_ROUNDS,
+        scale_pos_weight: Optional[float] = None,
     ):
-        super().__init__()
-        half = max(emb_dim // 2, 4)
+        self.params = dict(config.XGB_PARAMS)
+        if params:
+            self.params.update(params)
+        self.num_boost_round = num_boost_round
+        self.early_stopping_rounds = early_stopping_rounds
+        self.scale_pos_weight = scale_pos_weight
+        self.booster_: Optional[xgb.Booster] = None
+        self.best_iteration_: Optional[int] = None
+        self.feature_names_: Optional[list] = None
 
-        # ---- Section 6: learnable categorical embeddings ----
-        # self.account_emb = nn.Embedding(n_accounts, emb_dim)        # sender & receiver share this table
-        # self.bank_emb = nn.Embedding(n_banks, half)                 # from & to bank share this table
-        self.payfmt_emb = nn.Embedding(n_payment_formats, half)
-        self.currency_emb = nn.Embedding(n_currencies, half)        # payment & receiving currency share this table
+    def fit(self, X_train: pd.DataFrame, y_train: np.ndarray, X_val: pd.DataFrame, y_val: np.ndarray) -> "Model":
+        params = dict(self.params)
+        if self.scale_pos_weight is not None:
+            params["scale_pos_weight"] = self.scale_pos_weight
+        elif "scale_pos_weight" not in params:
+            n_pos, n_neg = int(np.sum(y_train == 1)), int(np.sum(y_train == 0))
+            params["scale_pos_weight"] = max(n_neg / max(n_pos, 1), 1.0)
 
-        embed_total_dim = (
-            half + #payment format
-            half + #payment currency
-            half #receiving currency
+        self.feature_names_ = list(X_train.columns)
+        dtrain = xgb.DMatrix(X_train, label=y_train, enable_categorical=True)
+        dval = xgb.DMatrix(X_val, label=y_val, enable_categorical=True)
+
+        self.booster_ = xgb.train(
+            params, dtrain, num_boost_round=self.num_boost_round,
+            evals=[(dval, "validation")], early_stopping_rounds=self.early_stopping_rounds,
+            verbose_eval=False,
         )
-        self.input_proj = nn.Linear(numeric_dim + embed_total_dim, hidden_dim)
+        self.best_iteration_ = self.booster_.best_iteration
+        return self
 
-        # ---- View A: structural / topology (attention over money flow) ----
-        self.gat_layers = nn.ModuleList([
-            GATConv(hidden_dim, hidden_dim // gat_heads, heads=gat_heads,
-                    concat=True, dropout=dropout)
-            for _ in range(num_layers)
-        ])
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        if self.booster_ is None:
+            raise RuntimeError("Call .fit() (or .load()) before .predict_proba().")
+        X = X.loc[:, self.feature_names_] if self.feature_names_ else X
+        dmatrix = xgb.DMatrix(X, enable_categorical=True)
+        iteration_range = (0, self.best_iteration_ + 1) if self.best_iteration_ is not None else (0, 0)
+        return self.booster_.predict(dmatrix, iteration_range=iteration_range)
 
-        # ---- View B: account-context (smoothing over the flow graph) ----
-        self.gcn_layers = nn.ModuleList([
-            GCNConv(hidden_dim, hidden_dim) for _ in range(num_layers)
-        ])
+    def feature_importance(self, top_n: Optional[int] = 25, importance_type: str = "gain") -> pd.DataFrame:
+        """Gain-based, normalized 0-1, sorted descending -- check this
+        after training to see how much any single feature (e.g. a raw
+        payment-format code) dominates. See README.md."""
+        if self.booster_ is None:
+            raise RuntimeError("Call .fit() (or .load()) before .feature_importance().")
+        raw = self.booster_.get_score(importance_type=importance_type)
+        importance = pd.Series(raw, name="importance").sort_values(ascending=False)
+        if importance.sum() > 0:
+            importance = importance / importance.sum()
+        out = importance.reset_index().rename(columns={"index": "feature"})
+        return out.head(top_n) if top_n else out
 
-        # ---- View C: transaction-attribute view (graph-free) ----
-        self.attr_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+    def save(self, path: str):
+        if self.booster_ is None:
+            raise RuntimeError("Nothing to save -- call .fit() first.")
+        self.booster_.save_model(path)
+        with open(f"{path}.meta.json", "w") as fl:
+            json.dump({"best_iteration": self.best_iteration_, "feature_names": self.feature_names_,
+                       "params": self.params}, fl)
 
-        self.fusion = nn.Linear(hidden_dim * 3, hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        # ---- Section 10: MLP classifier head ----
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-
-    def embed_categoricals(self, batch) -> torch.Tensor:
-        return torch.cat([
-            # self.account_emb(batch.sender_idx),
-            # self.account_emb(batch.receiver_idx),
-            # self.bank_emb(batch.from_bank_idx),
-            # self.bank_emb(batch.to_bank_idx),
-            self.payfmt_emb(batch.payment_format_idx),
-            self.currency_emb(batch.payment_currency_idx),
-            self.currency_emb(batch.receiving_currency_idx),
-        ], dim=-1)
-
-    def forward(self, batch) -> torch.Tensor:
-        """`batch` is a (sub)graph with .x, .edge_index, .<cat>_idx attrs.
-        Returns raw logits of shape [N] (apply torch.sigmoid for probability)."""
-        cat_emb = self.embed_categoricals(batch)
-        h0 = F.relu(self.input_proj(torch.cat([batch.x, cat_emb], dim=-1)))
-
-        h_struct = h0
-        for layer in self.gat_layers:
-            h_struct = F.relu(layer(h_struct, batch.edge_index))
-            h_struct = self.dropout(h_struct)
-
-        h_ctx = h0
-        for layer in self.gcn_layers:
-            h_ctx = F.relu(layer(h_ctx, batch.edge_index))
-            h_ctx = self.dropout(h_ctx)
-
-        h_attr = self.attr_mlp(h0)
-
-        fused = F.relu(self.fusion(torch.cat([h_struct, h_ctx, h_attr], dim=-1)))
-        fused = self.dropout(fused)
-
-        logits = self.classifier(fused).squeeze(-1)
-        return logits
-
-
-if __name__ == "__main__":
-    from data_processing import load_and_clean, vocab_sizes
-    from graph_construction import build_transaction_graph
-    from feature_engineering import engineer_all_features
-    from pyg_export import build_pyg_data, NUMERIC_FEATURE_COLUMNS
-    from neighbor_sampling import SimpleNeighborLoader
-
-    df, vocabs = load_and_clean("HI-Small_Trans_SYNTHETIC.csv")
-    g, src, dst, preds, succs = build_transaction_graph(df)
-    df = engineer_all_features(df, preds, succs, src, dst)
-    data, scaler = build_pyg_data(df, src, dst, fit_scaler=True)
-    vs = vocab_sizes(vocabs)
-
-    model = LineMVGNN(
-        numeric_dim=len(NUMERIC_FEATURE_COLUMNS),
-        n_accounts=vs["n_accounts"], n_banks=vs["n_banks"],
-        n_payment_formats=vs["n_payment_formats"], n_currencies=vs["n_currencies"],
-    )
-    print(model)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Total trainable parameters: {n_params:,}")
-
-    loader = SimpleNeighborLoader(
-        data, preds,
-        num_neighbors=[15,10],
-        input_nodes=torch.arange(data.num_nodes),
-        batch_size=256,
-    )
-    batch = next(iter(loader))
-    logits = model(batch)
-    print("logits shape:", logits.shape, "seed_size:", batch.seed_size)
-    probs = torch.sigmoid(logits[:batch.seed_size])
-    print("sample probabilities:", probs[:5])
+    @classmethod
+    def load(cls, path: str) -> "Model":
+        instance = cls()
+        instance.booster_ = xgb.Booster()
+        instance.booster_.load_model(path)
+        try:
+            with open(f"{path}.meta.json") as fl:
+                meta = json.load(fl)
+            instance.best_iteration_ = meta.get("best_iteration")
+            instance.feature_names_ = meta.get("feature_names")
+            instance.params = meta.get("params", instance.params)
+        except FileNotFoundError:
+            instance.best_iteration_ = getattr(instance.booster_, "best_iteration", None)
+        return instance

@@ -1,160 +1,203 @@
-# Graph-Based AML Detection with LineMVGNN
+# AML Detection -- ExSTraQt-style pipeline
 
-Implementation of the PRD: transaction-level graph construction (NetworKit)
-→ feature engineering → PyTorch Geometric export → LineMVGNN training →
-evaluation → model persistence → inference → account-level risk
-aggregation → Streamlit dashboard — with **every heavy-compute section
-wrapped in a timer**, so you can see exactly where a run's time goes.
+Feature-generation philosophy switched from "one transaction graph -> tree
+ensemble" to ExSTraQt's "multiple graph representations -> multiple
+feature-extraction pipelines -> merge -> one XGBoost". `data_processing.py`
+and `feature_engineering.py` (behavioral/temporal/pair-history features)
+are unchanged and still used -- this is additive, not a rewrite.
 
-## Quick start
+```
+CSV
+  |
+  v
+data_processing.py        clean, encode, sort chronologically (unchanged)
+  |
+  v
+graph_construction.py     TWO graphs: transaction graph (unchanged) + account graph (new)
+  |                                                          |
+  v                                                          v
+feature_engineering.py                    community_detection.py, flow_features.py
+(unchanged: pair history, velocity,       (new: Leiden + random-walk communities,
+ entropy, concentration, ...)              dispense/sink/passthrough + temporal flow)
+  |                                                          |
+  +----------------------------+-----------------------------+
+                               v
+                        feature_merge.py
+                               |
+                               v
+                       model.py / train.py   (one XGBoost)
+                               |
+                               v
+                 explain.py (SHAP)  +  aggregation.py / dashboard/app.py
+```
+
+## About `payment_format_idx`
+
+The result you found -- removing `payment_format` drops PR-AUC from
+0.4552 to 0.2606 -- is very unlikely to be a bug in the feature
+engineering. It's a known property of the **IBM synthetic AML dataset**:
+the data generator ties certain payment formats (most notoriously
+`Reinvestment`) almost deterministically to specific laundering
+typologies it simulates. That's real, valid signal in this dataset, not
+leakage -- but it's also narrow and fragile: a model that gets most of its
+lift from one categorical field has learned "which typology-generator
+produced this row" more than "what does laundering *behavior* look like".
+That gap is exactly what community/flow structure is meant to close.
+
+Check `model.feature_importance()` (or `explain.summary()` for the SHAP
+version) after training and look at `payment_format_idx`'s share. In our
+own smoke tests (synthetic data with the same format-to-label correlation
+deliberately injected), adding the ExSTraQt feature groups took it from
+dominating by a wide margin down to roughly 10% of total gain -- not
+because anything suppresses it directly, just because there are now many
+more informative, competing features. If it's still dominant on your real
+data after this, that's a useful diagnostic (the IBM generator's
+format-to-label coupling is even stronger than the graph signal here),
+not a sign the pipeline is broken.
+
+One more thing worth knowing: the original `model.py` had a
+`FEATURE_WEIGHT_OVERRIDES` mechanism manually downweighting
+`payment_format_idx` to 0.1 for XGBoost -- a hand-tuned patch for the same
+symptom. Your "full_feature_set" baseline numbers were already computed
+*with* that dampening applied, for what it's worth.
+
+## Project layout
+
+```
+AML-Detection/
+├── data/
+│   ├── raw/          # put HI-Small_Trans.csv / LI-Small_Trans.csv here
+│   ├── processed/
+│   └── exports/       # transaction_view.csv / account_view.csv / feature_importance.csv
+├── cache/
+│   ├── graphs/         # account_graph_{key}.pkl, account_graph_edges_{key}.parquet
+│   ├── communities/    # leiden_{key}.pkl, random_walk_{key}.pkl
+│   ├── features/       # community_stats_*, flow_*  (parquet/pickle)
+│   ├── models/
+│   └── explainability/
+├── notebooks/
+│   └── train.ipynb    # main entry point
+├── dashboard/
+│   └── app.py          # streamlit run dashboard/app.py
+└── src/
+    ├── config.py             every path + tunable in one place
+    ├── utils.py               cache_pickle / cache_parquet -- the caching pattern used everywhere below
+    ├── data_processing.py     unchanged: clean, encode, sort chronologically
+    ├── graph_construction.py  BOTH graphs: transaction graph (unchanged) + account graph (new, Eq. 1)
+    ├── feature_engineering.py unchanged: pair history, velocity, entropy, concentration, ...
+    ├── base_feature_columns.py  unchanged (renamed from feature_columns.py to avoid a name clash)
+    ├── community_detection.py  Leiden + random-walk communities + their statistics
+    ├── flow_features.py        dispense / sink / passthrough + temporal flow tracing
+    ├── feature_merge.py        behavior + flow + community -> final dataframe (+ caching, + column registry)
+    ├── model.py                one XGBoost (num_parallel_tree=10 boosted-forest hybrid)
+    ├── train.py                train() / predict() / evaluate() / save_model() / load_model() only
+    ├── explain.py               SHAP: global summary, per-transaction waterfall, dependence
+    └── aggregation.py          unchanged: transaction view -> account roll-up -> alerts
+```
+
+## Running it
 
 ```bash
-pip install torch torch_geometric networkit pandas numpy scikit-learn plotly streamlit
-jupyter notebook aml_gnn_pipeline.ipynb     # Run All
-streamlit run dashboard.py                  # after the notebook has run once
+pip install -r requirements.txt
+# put HI-Small_Trans.csv (and optionally LI-Small_Trans.csv) in data/raw/
+jupyter notebook notebooks/train.ipynb
 ```
 
-## Three real bugs found and fixed at IBM-AML scale (4.5M-6M rows)
+or from a script:
 
-The first version of this worked fine on a small synthetic dataset but
-**crashed Colab with an OOM kill** on the real `HI-Small_Trans.csv` /
-`LI-Small_Trans.csv` files. Each of the three fixes below was confirmed
-with a direct before/after measurement at the real dataset's scale
-(4.48M train rows / 422k accounts, matching the user's actual numbers),
-not guessed at:
+```python
+import sys; sys.path.insert(0, "src")
+import config
+from data_processing import load_and_clean
+import train as T
 
-### 1. Graph adjacency: N small objects → one flat CSR structure
-`graph_construction.py` was storing each transaction's predecessors/
-successors as its own little Python list, later converted to its own
-little numpy array — at 4.5M+6.1M nodes that's ~21 million individual
-objects, each paying ~100+ bytes of pure object-header overhead before a
-single byte of real data. **Not NetworKit's fault** — `nk.Graph` itself
-is fine; this was the Python glue code around it. Fixed with a CSR
-(compressed-sparse-row) layout: one flat `indices` array for every edge
-in the whole graph + one `indptr` array of length N+1, with a thin
-`CSRAdjacency` wrapper so `adj[node]` still works everywhere it's used.
-Edge construction itself was also rewritten to be vectorized per
-receiver-account group instead of a 4.5M-iteration Python loop.
-
-  **Measured at train-set scale (4.49M rows):** old approach peaked at
-  3.83GB and took 53s; new approach peaked at 2.87GB (-25%) and took
-  16s (-70%). Verified byte-for-byte identical output (same edge set,
-  same adjacency) against the old implementation first.
-
-### 2. DataFrame dtypes: object/float64 columns repeating a handful of values millions of times
-Independent of the graph, just *loading and cleaning* both CSVs was
-hitting ~3.7GB peak in a small (3.9GB) test environment — `Payment
-Format`/`Payment Currency`/`Receiving Currency` each have **6-16 unique
-values** but were costing ~65-70MB per column at 4.5M rows storing that
-handful of strings as a full Python object on every row. Fixed by
-parsing straight into `category` dtype in `read_csv` (not converting
-after the fact, which would briefly hold both representations at once),
-`float32` for amounts, and downcasting embedding-index columns to the
-smallest safe int type. `Sender Account`/`Receiver Account` (and the two
-currency columns) needed a **shared** `CategoricalDtype` across both
-columns, not independently-built ones — pandas categoricals can only be
-compared with `==`/`!=` if their `.categories` match, which the
-sender≠receiver cleaning filter relies on.
-
-  **Measured:** cleaned train DataFrame dropped from 0.98GB → 0.52GB
-  deep memory (-46%), test from 1.33GB → 0.68GB (-49%).
-
-### 3. Workflow: don't hold train's graph hostage while building test's
-Even with both fixes above, building train's graph then test's graph
-**in the same process** (exactly what the original notebook did, back to
-back, before training even started) still ran out of memory in testing —
-because nothing was ever freed, so test's graph got built *on top of*
-train's still-fully-resident graph, features, and DataFrame. The
-notebook is restructured into two phases: fully process **and train** on
-TRAIN first, explicitly `del` everything train-specific + `gc.collect()`
-once weights are saved (Section 7.5), *then* load TEST for the first
-time. Only the trained model, the fitted scaler, and the vocabularies
-cross from phase 1 to phase 2 — not one row of train data.
-
-  **Measured:** with all three fixes, the full train→test sequence that
-  previously OOM-killed now completes, peaking at 3.83GB in the same
-  constrained test environment that couldn't even finish *loading* both
-  files at 3.74GB before fix #2.
-
-**If you still hit memory pressure on the real files:** try a high-RAM
-runtime, or run Phase 1 (through Section 7.5, which saves
-`line_mvgnn_weights.pth` + `preprocessing_state.pkl` to disk) and Phase 2
-(Section 8 onward, loading those files back) as two **separate** Colab
-sessions, so each starts from a fully clean memory state.
-
-## What's timed, and what we actually saw (small synthetic run)
-
-| Stage | Share of total time |
-|---|---|
-| **Model Training (total)** | ~48% |
-| &nbsp;&nbsp;↳ Forward/backward pass | ~42% |
-| &nbsp;&nbsp;↳ Neighbor sampling | ~5% |
-| &nbsp;&nbsp;↳ Validation pass | ~2% |
-| Account-Context Feature Engineering | ~1-2.5% |
-| Transaction Flow Feature Engineering | ~0.5-1% |
-| Graph Construction (NetworKit) | ~0.1-0.5% |
-| Model Inference | ~0.3-0.7% |
-| Data Loading & Normalization | ~0.2% |
-| Pair-History / Temporal Features | <0.1% each |
-| Graph Export to PyTorch Geometric | <0.1% |
-| Account Risk Aggregation | <0.1% |
-
-Training's forward/backward pass dominates at this demo scale. Re-run
-Section 12 on the real files for numbers that reflect your actual data —
-at 10M+ rows the balance between graph/feature work and training will
-shift (graph construction and feature engineering are O(n) or O(n log n)
-and now genuinely fast; training cost scales with epochs × batches
-regardless of dataset size in between).
-
-## Two things this implementation had to decide that the PRD doesn't fully pin down
-
-1. **`LineMVGNN` architecture.** The PRD names it as "the primary GNN
-   architecture" and specifies its *purpose* and the embedding strategy
-   (Section 6), but not its internals. `model.py` implements it as a
-   **Multi-View GNN**: a structural/topology view (GAT attention over the
-   money-flow graph), an account-context view (GCN), and a graph-free
-   transaction-attribute view (MLP) — fused into the Section 10 classifier
-   head. If you have a specific paper or architecture in mind, swap out
-   `model.py`; the training loop, sampler, and evaluation code are
-   architecture-agnostic (they only depend on `model(batch) -> logits[N]`).
-
-2. **`NeighborLoader` substitution.** `torch_geometric.loader.NeighborLoader`
-   needs the compiled `pyg-lib` or `torch-sparse` extensions, which are
-   distributed as wheels from a separate package index (`data.pyg.org`)
-   that wasn't reachable while building this. `neighbor_sampling.py`
-   re-implements the same mini-batch-sampling idea in plain
-   Python/PyTorch using the predecessor adjacency lists from graph
-   construction. If your own environment can install `pyg-lib`/
-   `torch-sparse`, swap in the real `NeighborLoader` against the exact
-   same `Data` object — no other code changes needed.
-
-## No real data was available here
-
-`HI-Small_Trans.csv` / `LI-Small_Trans.csv` (the IBM AML dataset) weren't
-uploaded, so `synthetic_data.py` generates a small stand-in dataset with
-the **same column schema** (plus a few injected layering chains / cycles
-so the model has something real to learn) so the full pipeline could be
-built, run, and timed end-to-end. **To use the real data**, just change
-the two file paths in Section 1 of the notebook — nothing else needs to
-change.
-
-## File guide
-
+df, vocabs = load_and_clean(str(config.TRAIN_CSV))
+result = T.train(df)
+print(result["metrics"])
+print(result["model"].feature_importance(top_n=20))
 ```
-aml_gnn_pipeline.ipynb     Main notebook -- run this first (two-phase: train fully, free, then test)
-dashboard.py                streamlit run dashboard.py (PRD Section 16)
 
-timing_utils.py             The Timer()/profiling harness everything else uses
-synthetic_data.py           Synthetic stand-in dataset generator (same schema as IBM-AML)
-data_processing.py          Section 3/4: cleaning, normalization, dtype optimization, shared train/test vocabularies
-graph_construction.py       Section 5: NetworKit transaction graph, vectorized edges, CSR adjacency
-feature_engineering.py      Sections 7-9: temporal / pair-history / flow / account-context features
-pyg_export.py               Section 4: DataFrame + edges -> torch_geometric.data.Data
-neighbor_sampling.py        Section 11: mini-batch neighbor sampler (NeighborLoader substitute)
-model.py                    Sections 6 & 10: LineMVGNN (multi-view GNN) + MLP classifier head
-train.py                    Section 11-12: training loop, evaluation metrics
-aggregation.py               Sections 14-16: transaction/account risk views, alerting
+`streamlit run dashboard/app.py` reads `data/exports/*.csv` the same way
+the original dashboard did (lightly patched to also handle the new
+single-model `feature_importance.csv` format -- see the diff comments in
+`dashboard/app.py`'s Model Insights tab).
 
-test_pipeline.py            Standalone smoke-test script, mirrors the notebook's two-phase flow
-requirements.txt
+## Caching
+
+ExSTraQt's expensive stages are graph/feature generation, not model
+training -- Leiden and multi-hop flow tracing are the ones worth caching.
+Every stage in `feature_merge.build_node_feature_table` follows:
+
+```python
+if cache_exists:
+    load_cache()
+else:
+    compute()
+    save_cache()
 ```
+
+via `utils.cache_pickle` / `utils.cache_parquet`, keyed by an explicit
+`cache_key` string (e.g. `"train"`, `"train_plus_val"`) you pass in --
+cache invalidation is deliberately explicit (delete the file, or use a
+different key) rather than an automatic hash of the input data, so you
+control exactly what a config change invalidates. `utils.clear_cache(...)`
+deletes specific cache files without wiping the whole tree.
+
+## Single machine vs. the paper's PySpark cluster
+
+The reference implementation (in `exstraqt-main.zip`, if you still have
+it) targets a distributed cluster or a 12-core/36GB workstation dedicated
+to this job, and reports multi-hour runtimes on the IBM *Large* file even
+there. This codebase makes the same algorithms run on a laptop by:
+
+1. **Candidate-node scoping** (`config.RESTRICT_TO_ACCOUNTS`, threaded
+   through `community_detection.random_walk_communities` and
+   `flow_features`'s `origin_accounts` parameters). The paper's own
+   production design (Section 4.7 / Figure 4) is a *secondary* system
+   sitting behind a cheap primary risk-based filter -- it was never meant
+   to score every account from scratch. Use this the same way: restrict
+   the expensive per-account stages to whatever your primary filter (or a
+   first-pass score) surfaces. Leiden and the account graph itself still
+   see every account regardless -- partitioning needs global structure.
+2. **Smaller default knobs** (`FLOW_TOP_N`, `FLOW_NUM_HOPS`,
+   `TEMPORAL_FLOW_TOP_N` in `config.py`) -- the flow-tracing join cost
+   grows like `O(n_accounts × top_n^hops)` transiently before each hop's
+   truncation kicks back in, which is fine on a cluster and isn't in a
+   single pandas process at the paper's own numbers (`top_n=50`).
+3. **igraph + joblib** instead of PySpark -- same underlying algorithms
+   (Leiden/leidenalg, personalized PageRank, biconnected components),
+   parallelized across CPU cores instead of a cluster.
+
+Rough scaling from our own (synthetic-data) testing: on an account graph
+with ~22k unique aggregated edges, Leiden took about 30 seconds; the same
+graph's random-walk communities took a few seconds per hundred target
+accounts. Leiden is the one step that must see the whole graph, so it's
+the likeliest bottleneck on the real IBM *Small*/*Medium* files -- if it's
+too slow, drop `LEIDEN_N_ITERATIONS`, or pre-filter very low-amount edges
+out of the account graph before partitioning.
+
+## Known simplifications vs. the reference implementation
+
+- **Community turnover features** skip the reference's per-currency/
+  per-bank decomposition (same groupby pattern, just on more columns --
+  a straightforward extension, left out to keep `community_detection.py`
+  reviewable).
+- **Flow-based features** follow the paper's textual profile definitions
+  (dispense = forward from own-sent total, sink = backward from
+  own-received total, passthrough = forward from own-received total)
+  rather than replicating every join-order detail of the reference's
+  PySpark implementation line for line -- the algorithmic result
+  (Figure 3's capped-chain semantics) is the same.
+- **Anti-leakage windowing** is one level simpler than the reference's
+  three-way (train / train+val / train+val+test) cumulative feature
+  windows: `train.train()` builds node features once on the training
+  split and reuses them for validation; `train.score_holdout()` documents
+  extending the same pattern to a true held-out file.
+
+## Ablation: is the new feature set actually why this is better?
+
+Set `COMBINE_WITH_BASE_FEATURES = False` in `notebooks/train.ipynb` (or
+pass `base_numeric_columns=None, base_categorical_columns=None` to
+`train.train()`) to train on ExSTraQt's own features alone, no
+`feature_engineering.py` output involved -- a clean apples-to-apples
+comparison against the current model.

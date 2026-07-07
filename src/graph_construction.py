@@ -1,7 +1,22 @@
 """
 graph_construction.py
 ----------------------
-PRD Section 5: "Transaction Graph Construction (NetworKit)"
+Builds BOTH graph representations this project uses. No feature
+engineering happens here -- that's feature_engineering.py (transaction
+graph) and flow_features.py / community_detection.py (account graph).
+
+  * `build_transaction_graph` -- PRD Section 5. One node PER TRANSACTION;
+    a directed edge T1 -> T2 exists iff receiver(T1) == sender(T2) and T2
+    happens within 10 days of T1. Excellent for temporal propagation
+    (relay timing, short cycles) -- unchanged from the original pipeline.
+
+  * `build_account_graph` -- ExSTraQt paper Section 3.1.2 / Eq. 1. One
+    node PER ACCOUNT; repeated transfers between the same two accounts
+    collapse into a single weighted edge (total amount, plus the
+    sender/receiver-balanced weight from Eq. 1). This is the graph
+    community_detection.py and flow_features.py operate on.
+
+PRD Section 5 continued (transaction graph):
 
 Each transaction is a node. A directed edge T1 -> T2 exists iff:
     receiver(T1) == sender(T2)
@@ -203,10 +218,109 @@ def build_transaction_graph(df: pd.DataFrame):
     return g, edge_src, edge_dst, predecessors, successors
 
 
+# ---------------------------------------------------------------------------
+# Account graph (ExSTraQt paper Section 3.1.2, Equation 1)
+# ---------------------------------------------------------------------------
+# One node per ACCOUNT rather than per transaction. Repeated transfers
+# between the same two accounts collapse into a single weighted edge:
+#
+#     A --$500--> B
+#     A --$100--> B          =>      A --(amount=$650, weight=W)--> B
+#     A --$50-->  B
+#
+# The weight isn't just the summed amount -- Eq. 1 combines the sender's
+# and receiver's OWN shares of that edge:
+#
+#     W(s->t) = amount(s->t)/total_sent(s) + amount(s->t)/total_received(t)
+#
+# so a launderer can't hide a high-volume relationship by routing through
+# one big intermediary account: doing that only shrinks ONE of the two
+# terms, not both. This weighted graph is what community_detection.py
+# (Leiden + random-walk) and flow_features.py trace over.
+
+import igraph as ig
+
+
+def build_aggregated_edges(
+    df: pd.DataFrame,
+    source_col: str = "Sender Account",
+    target_col: str = "Receiver Account",
+    amount_col: str = "Amount Paid",
+) -> pd.DataFrame:
+    """Collapse transaction-level rows into one row per unique
+    (source, target) pair with the total amount transferred.
+    Returns columns: source, target, amount."""
+    edges = (
+        df.groupby([source_col, target_col], observed=True)[amount_col]
+        .sum()
+        .reset_index()
+        .rename(columns={source_col: "source", target_col: "target", amount_col: "amount"})
+    )
+    edges["amount"] = edges["amount"].astype(np.float64)
+    return edges
+
+
+def compute_edge_weights(edges_agg: pd.DataFrame) -> pd.DataFrame:
+    """Equation 1. Adds `weight` and `amount_weighted` (= amount rescaled
+    by weight/weight.max(), what gets fed into Leiden -- see
+    community_detection.py) to an aggregated edge table."""
+    totals_sent = edges_agg.groupby("source")["amount"].sum()
+    totals_received = edges_agg.groupby("target")["amount"].sum()
+
+    out = edges_agg.copy()
+    s_total = out["source"].map(totals_sent).astype(np.float64)
+    r_total = out["target"].map(totals_received).astype(np.float64)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        weight = np.where(s_total > 0, out["amount"] / s_total, 0.0) + \
+                 np.where(r_total > 0, out["amount"] / r_total, 0.0)
+    out["weight"] = weight
+    max_weight = out["weight"].max()
+    out["amount_weighted"] = out["amount"] * (out["weight"] / max_weight if max_weight > 0 else 0.0)
+    return out
+
+
+def node_totals(edges_agg: pd.DataFrame) -> tuple:
+    """(totals_sent, totals_received) dicts, node -> total amount. Used by
+    flow_features.py to cap a traced flow at a node's own volume."""
+    totals_sent = edges_agg.groupby("source")["amount"].sum().to_dict()
+    totals_received = edges_agg.groupby("target")["amount"].sum().to_dict()
+    return totals_sent, totals_received
+
+
+def build_account_graph(
+    df: pd.DataFrame,
+    source_col: str = "Sender Account",
+    target_col: str = "Receiver Account",
+    amount_col: str = "Amount Paid",
+) -> tuple:
+    """
+    Returns (graph, edges_agg):
+        graph     : directed igraph.Graph, one vertex per account
+                    (vertex attribute "name" = account id), edge attribute
+                    "weight" = Eq. 1's amount_weighted.
+        edges_agg : the underlying aggregated+weighted edge DataFrame
+                    (source, target, amount, weight, amount_weighted) --
+                    community_detection.py and flow_features.py both need
+                    this directly, not just the igraph object.
+    """
+    edges_agg = build_aggregated_edges(df, source_col, target_col, amount_col)
+    edges_weighted = compute_edge_weights(edges_agg)
+
+    edge_df = edges_weighted.loc[:, ["source", "target"]]
+    graph = ig.Graph.DataFrame(edge_df, directed=True, use_vids=False)
+    graph.es["weight"] = edges_weighted["amount_weighted"].to_numpy()
+
+    return graph, edges_weighted
+
+
 if __name__ == "__main__":
     from data_processing import load_and_clean
-    df, vocabs = load_and_clean("HI-Small_Trans.csv")
+    df, vocabs = load_and_clean("data/HI-Small_Trans.csv")
     g, src, dst, preds, succs = build_transaction_graph(df)
     print("nodes:", g.numberOfNodes(), "edges:", g.numberOfEdges())
     print("avg out-degree:", src.shape[0] / g.numberOfNodes())
     print("max successor fan-out actually used:", succs.degrees().max())
+
+    account_graph, edges_agg = build_account_graph(df)
+    print("account graph:", account_graph.vcount(), "accounts,", account_graph.ecount(), "unique edges")
