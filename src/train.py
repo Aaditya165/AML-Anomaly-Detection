@@ -22,7 +22,7 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     average_precision_score, confusion_matrix, precision_recall_curve,
 )
-
+from pathlib import Path
 import feature_merge as fm
 from model import Model
 
@@ -56,6 +56,9 @@ def evaluate(y_true: np.ndarray, probs: np.ndarray, threshold: float = 0.5) -> d
 
 
 def train(
+    graph_cache_dir:Path,
+    community_cache_dir:Path,
+    feature_cache_dir:Path,
     df: pd.DataFrame,
     val_frac: float = 0.15,
     restrict_to_accounts=None,
@@ -82,6 +85,7 @@ def train(
     df_train, df_val = chronological_split(df, val_frac=val_frac)
 
     node_features = fm.build_node_feature_table(
+        graph_cache_dir, community_cache_dir, feature_cache_dir,
         df_train, source_col, target_col, amount_col, timestamp_col,
         restrict_to_accounts=restrict_to_accounts, cache_key="train", use_cache=use_cache,
     )
@@ -114,6 +118,9 @@ def predict(model: Model, df_joined: pd.DataFrame, feature_columns: dict) -> np.
 
 
 def score_holdout(
+    graph_cache_dir: Path,
+    community_cache_dir: Path,
+    feature_cache_dir: Path,
     model: Model, df_train_plus_val: pd.DataFrame, df_holdout: pd.DataFrame,
     feature_columns: dict, threshold: float, restrict_to_accounts=None,
     source_col: str = "Sender Account", target_col: str = "Receiver Account",
@@ -125,6 +132,7 @@ def score_holdout(
     influence their own community/flow features (same pattern `train()`
     uses for validation, just one split further out)."""
     node_features = fm.build_node_feature_table(
+        graph_cache_dir, community_cache_dir, feature_cache_dir,
         df_train_plus_val, source_col, target_col, amount_col, timestamp_col,
         restrict_to_accounts=restrict_to_accounts, cache_key="train_plus_val", use_cache=use_cache,
     )

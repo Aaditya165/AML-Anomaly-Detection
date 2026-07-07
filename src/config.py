@@ -17,28 +17,6 @@ dedicated to exactly this job, and this codebase runs on a single machine
 (see README.md's "single machine vs. PySpark cluster" section).
 """
 
-from pathlib import Path
-
-# --- paths ---
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-RAW_DIR = DATA_DIR / "raw"
-PROCESSED_DIR = DATA_DIR / "processed"
-EXPORTS_DIR = DATA_DIR / "exports"
-
-CACHE_DIR = PROJECT_ROOT / "cache"
-GRAPH_CACHE_DIR = CACHE_DIR / "graphs"
-COMMUNITY_CACHE_DIR = CACHE_DIR / "communities"
-FEATURE_CACHE_DIR = CACHE_DIR / "features"
-MODEL_CACHE_DIR = CACHE_DIR / "models"
-EXPLAIN_CACHE_DIR = CACHE_DIR / "explainability"
-
-for _dir in (RAW_DIR, PROCESSED_DIR, EXPORTS_DIR, GRAPH_CACHE_DIR,
-             COMMUNITY_CACHE_DIR, FEATURE_CACHE_DIR, MODEL_CACHE_DIR, EXPLAIN_CACHE_DIR):
-    _dir.mkdir(parents=True, exist_ok=True)
-
-TRAIN_CSV = RAW_DIR / "HI-Small_Trans.csv"
-TEST_CSV = RAW_DIR / "LI-Small_Trans.csv"
 
 SEED = 42
 

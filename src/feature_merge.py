@@ -30,7 +30,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
-
+from pathlib import Path
 import config
 import utils
 from graph_construction import build_account_graph
@@ -63,6 +63,9 @@ def _fit_anomaly_scores(node_features: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 def build_node_feature_table(
+    graph_cache_dir:Path,
+    community_cache_dir:Path,
+    feature_cache_dir:Path,
     df: pd.DataFrame,
     source_col: str = "Sender Account",
     target_col: str = "Receiver Account",
@@ -71,6 +74,7 @@ def build_node_feature_table(
     restrict_to_accounts: Optional[Iterable[str]] = None,
     cache_key: Optional[str] = None,
     use_cache: bool = True,
+    
 ) -> pd.DataFrame:
     """
     Returns a DataFrame indexed by account id with every ExSTraQt
@@ -97,44 +101,44 @@ def build_node_feature_table(
 
     # --- graph ---
     edges_agg = _load(
-        config.GRAPH_CACHE_DIR / f"account_graph_edges_{key}.parquet",
+        graph_cache_dir / f"account_graph_edges_{key}.parquet",
         lambda: build_account_graph(df, source_col, target_col, amount_col)[1],
         kind="parquet",
     )
     graph = _load(
-        config.GRAPH_CACHE_DIR / f"account_graph_{key}.pkl",
+        graph_cache_dir / f"account_graph_{key}.pkl",
         lambda: build_account_graph(df, source_col, target_col, amount_col)[0],
     )
 
     # --- communities ---
-    leiden_membership = _load(config.COMMUNITY_CACHE_DIR / f"leiden_{key}.pkl", lambda: cd.leiden_communities(graph))
+    leiden_membership = _load(community_cache_dir / f"leiden_{key}.pkl", lambda: cd.leiden_communities(graph))
     bottom_up_membership = _load(
-        config.COMMUNITY_CACHE_DIR / f"random_walk_{key}.pkl",
+        community_cache_dir / f"random_walk_{key}.pkl",
         lambda: cd.random_walk_communities(edges_agg, graph, target_accounts=target_accounts),
     )
 
     # --- community statistics ---
     leiden_groups = cd.leiden_groups_from_membership(leiden_membership)
     leiden_stats = _load(
-        config.FEATURE_CACHE_DIR / f"community_stats_leiden_{key}.parquet",
+        feature_cache_dir / f"community_stats_leiden_{key}.parquet",
         lambda: cd.compute_community_statistics(df, leiden_groups, source_col, target_col, amount_col, timestamp_col, prefix="leiden"),
         kind="parquet",
     )
     local_stats = _load(
-        config.FEATURE_CACHE_DIR / f"community_stats_local_{key}.parquet",
+        feature_cache_dir / f"community_stats_local_{key}.parquet",
         lambda: cd.compute_community_statistics(df, bottom_up_membership, source_col, target_col, amount_col, timestamp_col, prefix="local"),
         kind="parquet",
     )
     leiden_node_table = cd.broadcast_leiden_features(leiden_membership, leiden_stats)
 
     # --- flow features ---
-    dispense = _load(config.FEATURE_CACHE_DIR / f"flow_dispense_{key}.parquet",
+    dispense = _load(feature_cache_dir / f"flow_dispense_{key}.parquet",
                       lambda: ff.compute_dispense_features(edges_agg, origin_accounts=target_accounts), kind="parquet")
-    sink = _load(config.FEATURE_CACHE_DIR / f"flow_sink_{key}.parquet",
+    sink = _load(feature_cache_dir / f"flow_sink_{key}.parquet",
                  lambda: ff.compute_sink_features(edges_agg, origin_accounts=target_accounts), kind="parquet")
-    passthrough = _load(config.FEATURE_CACHE_DIR / f"flow_passthrough_{key}.parquet",
+    passthrough = _load(feature_cache_dir / f"flow_passthrough_{key}.parquet",
                          lambda: ff.compute_passthrough_features(edges_agg, origin_accounts=target_accounts), kind="parquet")
-    temporal = _load(config.FEATURE_CACHE_DIR / f"flow_temporal_{key}.pkl",
+    temporal = _load(feature_cache_dir / f"flow_temporal_{key}.pkl",
                       lambda: ff.compute_temporal_flow_features(df, source_col, target_col, amount_col, timestamp_col))
     # temporal is a dict of 3 DataFrames -- cache_pickle (not cache_parquet) handles that natively
 
