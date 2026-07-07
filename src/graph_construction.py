@@ -307,7 +307,10 @@ def build_account_graph(
     edges_agg = build_aggregated_edges(df, source_col, target_col, amount_col)
     edges_weighted = compute_edge_weights(edges_agg)
 
-    edge_df = edges_weighted.loc[:, ["source", "target"]]
+    edge_df = edges_weighted.loc[:, ["source", "target"]].copy()
+    edge_df["source"] = edge_df["source"].astype(str)
+    edge_df["target"] = edge_df["target"].astype(str)
+    
     graph = ig.Graph.DataFrame(edge_df, directed=True, use_vids=False)
     graph.es["weight"] = edges_weighted["amount_weighted"].to_numpy()
 
