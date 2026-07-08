@@ -22,11 +22,7 @@ SEED = 42
 
 # --- Section 4.1 Community Detection ---
 LEIDEN_N_ITERATIONS = 100
-RANDOM_WALK_N_HOPS = 2
-RANDOM_WALK_CANDIDATE_TOP_N = 45
-RANDOM_WALK_PPR_DAMPING = 0.85
-RANDOM_WALK_MEMBERSHIP_THRESHOLD = 0.01
-RANDOM_WALK_N_JOBS = -1
+
 # Cap used when leiden_membership is passed to random_walk_communities (see
 # its docstring) -- Leiden isn't guaranteed to produce evenly-sized
 # communities on every graph, so this is the safety net against the
@@ -44,7 +40,7 @@ FLOW_NUM_HOPS = 4
 TEMPORAL_FLOW_TOP_N = 20
 
 # --- Section 4.5 Anomaly scoring ---
-ISOLATION_FOREST_N_ESTIMATORS = 1_000
+ISOLATION_FOREST_N_ESTIMATORS = 400
 ISOLATION_FOREST_MAX_SAMPLES = "auto"
 
 # --- Model ---

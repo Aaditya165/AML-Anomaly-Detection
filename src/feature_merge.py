@@ -111,23 +111,12 @@ def build_node_feature_table(
 
     # --- communities ---
     leiden_membership = _load(community_cache_dir / f"leiden_{key}.pkl", lambda: cd.leiden_communities(graph))
-    bottom_up_membership = _load(
-        community_cache_dir / f"random_walk_{key}.pkl",
-        lambda: cd.random_walk_communities(
-            edges_agg, graph, target_accounts=target_accounts, leiden_membership=leiden_membership,
-        ),
-    )
 
     # --- community statistics ---
     leiden_groups = cd.leiden_groups_from_membership(leiden_membership)
     leiden_stats = _load(
         feature_cache_dir / f"community_stats_leiden_{key}.parquet",
         lambda: cd.compute_community_statistics(df, leiden_groups, source_col, target_col, amount_col, timestamp_col, prefix="leiden"),
-        kind="parquet",
-    )
-    local_stats = _load(
-        feature_cache_dir / f"community_stats_local_{key}.parquet",
-        lambda: cd.compute_community_statistics(df, bottom_up_membership, source_col, target_col, amount_col, timestamp_col, prefix="local"),
         kind="parquet",
     )
     leiden_node_table = cd.broadcast_leiden_features(leiden_membership, leiden_stats)
