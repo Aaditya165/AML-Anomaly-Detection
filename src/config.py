@@ -20,7 +20,7 @@ dedicated to exactly this job, and this codebase runs on a single machine
 
 SEED = 42
 
-MAX_GRAPH_METRICS_COMMUNITY_SIZE = 5000
+MAX_GRAPH_METRICS_COMMUNITY_SIZE = 1000
 #to prevent memory blowup when computing graph metrics on the largest communities
 # Real Leiden output on the IBM-Small file: only 16/34,616 communities
 # exceed 1000 members, only 8 exceed 5000 -- diameter/assortativity/
@@ -35,7 +35,7 @@ MAX_GRAPH_METRICS_COMMUNITY_SIZE = 5000
 # can itself be a large fraction of the whole file. Sampled down to this
 # many rows rather than skipped outright (unlike graph metrics, an
 # amount/turnover estimate from a large random sample is still meaningful).
-MAX_TURNOVER_STATS_ROWS = 200_000
+MAX_TURNOVER_STATS_ROWS = 50_000
 
 # --- Section 4.1 Community Detection ---
 LEIDEN_N_ITERATIONS = 100
