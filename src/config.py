@@ -20,7 +20,7 @@ dedicated to exactly this job, and this codebase runs on a single machine
 
 SEED = 42
 
-MAX_GRAPH_METRICS_COMMUNITY_SIZE = 1000
+MAX_GRAPH_METRICS_COMMUNITY_SIZE = 500
 #to prevent memory blowup when computing graph metrics on the largest communities
 # Real Leiden output on the IBM-Small file: only 16/34,616 communities
 # exceed 1000 members, only 8 exceed 5000 -- diameter/assortativity/
