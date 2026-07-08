@@ -74,7 +74,6 @@ def build_node_feature_table(
     restrict_to_accounts: Optional[Iterable[str]] = None,
     cache_key: Optional[str] = None,
     use_cache: bool = True,
-    
 ) -> pd.DataFrame:
     """
     Returns a DataFrame indexed by account id with every ExSTraQt
@@ -114,7 +113,9 @@ def build_node_feature_table(
     leiden_membership = _load(community_cache_dir / f"leiden_{key}.pkl", lambda: cd.leiden_communities(graph))
     bottom_up_membership = _load(
         community_cache_dir / f"random_walk_{key}.pkl",
-        lambda: cd.random_walk_communities(edges_agg, graph, target_accounts=target_accounts),
+        lambda: cd.random_walk_communities(
+            edges_agg, graph, target_accounts=target_accounts, leiden_membership=leiden_membership,
+        ),
     )
 
     # --- community statistics ---

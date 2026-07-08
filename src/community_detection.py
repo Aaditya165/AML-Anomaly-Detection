@@ -61,7 +61,17 @@ def _build_candidate_neighborhoods(edges_agg: pd.DataFrame, top_n: int) -> Dict[
     """For every account, its 2-hop *candidate* neighborhood: the union of
     its own top-N (by undirected weight) neighbors' top-N neighbors. This
     bounded pool is what personalized PageRank then runs over, so a hub
-    account can't blow up every other account's induced subgraph."""
+    account can't blow up every other account's induced subgraph.
+
+    This is the ORIGINAL candidate-construction strategy: purely local,
+    doesn't need Leiden's output, and needs `target_accounts` (in
+    `random_walk_communities`) to bound total cost since every account's
+    candidate pool is built independently regardless of global structure.
+    See `_build_candidate_neighborhoods_from_leiden` for an alternative
+    that nests inside the already-computed Leiden partition instead --
+    that one bounds cost from the community-size side rather than needing
+    you to restrict which accounts get processed at all.
+    """
     fwd = edges_agg.loc[:, ["source", "target", "amount"]]
     rev = fwd.rename(columns={"source": "target", "target": "source"})
     undirected = pd.concat([fwd, rev], ignore_index=True)
@@ -76,6 +86,86 @@ def _build_candidate_neighborhoods(edges_agg: pd.DataFrame, top_n: int) -> Dict[
         candidates = {node} | neighbors
         for nb in neighbors:
             candidates |= neighbor_map.get(nb, set())
+        neighborhoods[node] = candidates
+    return neighborhoods
+
+
+def _build_candidate_neighborhoods_from_leiden(
+    edges_agg: pd.DataFrame,
+    leiden_membership: Dict[str, str],
+    include_bridge_neighbors: bool = True,
+    max_candidates: int = 500,
+) -> Dict[str, Set[str]]:
+    """
+    Alternative to `_build_candidate_neighborhoods`: candidate pool = the
+    account's own Leiden community, optionally unioned with the Leiden
+    communities of its DIRECT neighbors (so cross-community bridging --
+    the entire reason bottom-up detection exists ALONGSIDE Leiden, per
+    Section 4.1 -- isn't silently defeated by nesting inside Leiden's
+    partition; an account whose direct neighbor sits in a different
+    community can still reach that neighbor's community).
+
+    Every account gets a candidate pool this way regardless of
+    `target_accounts` -- Leiden's own partition does the cost-bounding
+    instead of you needing to restrict which accounts get processed. This
+    means you can run `random_walk_communities` for every account without
+    losing coverage the way a blind `target_accounts` restriction would.
+
+    `max_candidates`: hard safety cap. Leiden is NOT guaranteed to produce
+    evenly-sized communities on every graph -- a sufficiently dominant hub
+    (or a small number of them) can still pull a large fraction of the
+    graph into one community (measured as high as ~11% of all accounts in
+    one community on a hub-heavy synthetic test). When a pool exceeds this
+    cap, the account's OWN community is kept in full (that's the primary
+    context) and bridge-community members are added, sorted by the
+    bridging edge's own weight, only until the cap is reached -- rather
+    than silently processing an enormous subgraph for the unlucky
+    accounts that happen to share a community with a hub.
+    """
+    community_members = leiden_groups_from_membership(leiden_membership)
+
+    direct_neighbors: Dict[str, list] = {}
+    if include_bridge_neighbors:
+        fwd = edges_agg.loc[:, ["source", "target", "amount"]]
+        rev = fwd.rename(columns={"source": "target", "target": "source"})
+        undirected = pd.concat([fwd, rev], ignore_index=True)
+        undirected = undirected.groupby(["source", "target"], observed=True)["amount"].sum().reset_index()
+        undirected = undirected.sort_values("amount", ascending=False)
+        for source, group in undirected.groupby("source", sort=False):
+            direct_neighbors[source] = list(group["target"])  # already sorted by weight desc
+
+    neighborhoods: Dict[str, Set[str]] = {}
+    for node, community_id in leiden_membership.items():
+        own_community = community_members[community_id]
+
+        if len(own_community) >= max_candidates:
+            # own community alone already fills the budget -- no room for
+            # bridging regardless; truncate deterministically.
+            candidates = set(list(own_community)[:max_candidates])
+        else:
+            candidates = set(own_community)
+            if include_bridge_neighbors:
+                seen_bridge_communities = set()
+                for neighbor in direct_neighbors.get(node, []):
+                    remaining_budget = max_candidates - len(candidates)
+                    if remaining_budget <= 0:
+                        break
+                    neighbor_community_id = leiden_membership.get(neighbor)
+                    if neighbor_community_id is None or neighbor_community_id == community_id:
+                        continue
+                    if neighbor_community_id in seen_bridge_communities:
+                        continue
+                    seen_bridge_communities.add(neighbor_community_id)
+                    bridge_members = community_members[neighbor_community_id]
+                    if len(bridge_members) > remaining_budget:
+                        # partial add -- fill the remaining budget only,
+                        # rather than either dropping this whole bridge
+                        # community or blowing past the cap
+                        candidates |= set(list(bridge_members)[:remaining_budget])
+                        break
+                    candidates |= set(bridge_members)
+
+        candidates.add(node)
         neighborhoods[node] = candidates
     return neighborhoods
 
@@ -104,6 +194,22 @@ def _personalized_pagerank_community(
     return node, keep
 
 
+def _personalized_pagerank_batch(
+    accounts: List[str], neighborhoods: Dict[str, Set[str]], graph: ig.Graph, node_index: Dict[str, int],
+    damping: float, threshold: float,
+) -> List[Tuple[str, Set[str]]]:
+    """Same computation as calling `_personalized_pagerank_community` once
+    per account, just grouped into one dispatched task -- at hundreds of
+    thousands of accounts, one joblib task per account means hundreds of
+    thousands of tiny dispatches, each paying its own scheduling overhead
+    regardless of backend. Batching amortizes that overhead; it changes
+    nothing about the result."""
+    return [
+        _personalized_pagerank_community(node, neighborhoods[node], graph, node_index, damping, threshold)
+        for node in accounts
+    ]
+
+
 def random_walk_communities(
     edges_agg: pd.DataFrame,
     graph: ig.Graph,
@@ -112,29 +218,62 @@ def random_walk_communities(
     threshold: float = config.RANDOM_WALK_MEMBERSHIP_THRESHOLD,
     n_jobs: int = config.RANDOM_WALK_N_JOBS,
     target_accounts: Optional[Iterable[str]] = None,
+    batch_size: int = 200,
+    leiden_membership: Optional[Dict[str, str]] = None,
+    max_candidates_from_leiden: int = config.RANDOM_WALK_MAX_CANDIDATES_FROM_LEIDEN,
 ) -> Dict[str, Set[str]]:
     """
     One OVERLAPPING community per account in `target_accounts` (default:
     every account in the graph). Returns {account_id: {its local community
     members}}.
 
-    Cost note: this is the single most expensive stage in the pipeline --
-    one induced-subgraph + personalized-PageRank call per target account.
-    Use `target_accounts` (see config.RESTRICT_TO_ACCOUNTS) to restrict
-    this to the accounts you actually need rather than every account in
-    the file.
+    Two ways to build each account's candidate pool (what personalized
+    PageRank actually runs over):
+
+      * `leiden_membership=None` (default) -- the original strategy: each
+        account's own top-N-by-weight neighbors' top-N neighbors, built
+        independently of any community structure. Needs `target_accounts`
+        to bound total cost, since nothing here stops a hub-adjacent
+        account's pool from ballooning.
+      * `leiden_membership=<the dict from leiden_communities(...)>` --
+        nests inside the ALREADY-COMPUTED Leiden partition instead: each
+        account's pool is its own Leiden community (+ bridging neighbors'
+        communities, capped at `max_candidates_from_leiden`). This lets
+        you run every account without `target_accounts` at all, since
+        Leiden's own partition (plus the hard cap) bounds the per-account
+        subgraph size instead. See
+        `_build_candidate_neighborhoods_from_leiden`'s docstring for the
+        cross-community-bridging reasoning and the cap's safety role.
+
+    Cost note, in order of expected impact:
+      1. `target_accounts` (if not using `leiden_membership`) -- restrict
+         to the accounts you actually need. Dwarfs everything else.
+      2. `candidate_top_n` / `max_candidates_from_leiden` -- the dominant
+         driver of PER-CALL cost.
+      3. `batch_size` -- accounts are grouped into chunks of this size per
+         dispatched joblib task, cutting per-task scheduling overhead
+         without changing the result.
+      `threshold` does NOT affect this stage's runtime -- PageRank runs
+      over the full induced neighborhood regardless of threshold; it only
+      changes which nodes survive into the returned community afterward.
     """
-    neighborhoods = _build_candidate_neighborhoods(edges_agg, candidate_top_n)
+    if leiden_membership is not None:
+        neighborhoods = _build_candidate_neighborhoods_from_leiden(
+            edges_agg, leiden_membership, max_candidates=max_candidates_from_leiden,
+        )
+    else:
+        neighborhoods = _build_candidate_neighborhoods(edges_agg, candidate_top_n)
     node_index = {name: i for i, name in enumerate(graph.vs["name"])}
 
     accounts_to_process = list(target_accounts) if target_accounts is not None else list(neighborhoods.keys())
     accounts_to_process = [a for a in accounts_to_process if a in neighborhoods]
 
-    results = Parallel(n_jobs=n_jobs, prefer="processes")(
-        delayed(_personalized_pagerank_community)(node, neighborhoods[node], graph, node_index, damping, threshold)
-        for node in accounts_to_process
+    batches = [accounts_to_process[i:i + batch_size] for i in range(0, len(accounts_to_process), batch_size)]
+    batch_results = Parallel(n_jobs=n_jobs, prefer="processes")(
+        delayed(_personalized_pagerank_batch)(batch, neighborhoods, graph, node_index, damping, threshold)
+        for batch in batches
     )
-    return dict(results)
+    return dict(pair for batch in batch_results for pair in batch)
 
 
 # ---------------------------------------------------------------------------

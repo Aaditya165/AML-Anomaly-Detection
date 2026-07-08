@@ -23,10 +23,15 @@ SEED = 42
 # --- Section 4.1 Community Detection ---
 LEIDEN_N_ITERATIONS = 100
 RANDOM_WALK_N_HOPS = 2
-RANDOM_WALK_CANDIDATE_TOP_N = 100
+RANDOM_WALK_CANDIDATE_TOP_N = 45
 RANDOM_WALK_PPR_DAMPING = 0.85
 RANDOM_WALK_MEMBERSHIP_THRESHOLD = 0.01
 RANDOM_WALK_N_JOBS = -1
+# Cap used when leiden_membership is passed to random_walk_communities (see
+# its docstring) -- Leiden isn't guaranteed to produce evenly-sized
+# communities on every graph, so this is the safety net against the
+# unlucky accounts that land in one hub-dominated community.
+RANDOM_WALK_MAX_CANDIDATES_FROM_LEIDEN = 500
 
 # --- Section 4.2 Flow-based features (Algorithm 1) ---
 # Memory scales like O(n_accounts * FLOW_TOP_N^FLOW_NUM_HOPS) transiently
