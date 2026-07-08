@@ -172,7 +172,7 @@ def compute_community_statistics(
     target_col: str = "Receiver Account",
     amount_col: str = "Amount Paid",
     timestamp_col: str = "Timestamp",
-    n_jobs: int = config.RANDOM_WALK_N_JOBS,
+    n_jobs: int = -1,
     prefix: str = "community",
 ) -> pd.DataFrame:
     """
@@ -183,8 +183,6 @@ def compute_community_statistics(
                        `leiden_communities` + a groupby), then broadcast
                        each community's row back onto its members
                        (feature_merge.py does this broadcast).
-      * Random-walk -> already IS {account: {its own local members}}, so
-                       the returned table is already account-indexed.
 
     Returns a DataFrame indexed by `key`, columns prefixed `{prefix}_`.
     """
