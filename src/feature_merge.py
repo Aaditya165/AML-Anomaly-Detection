@@ -132,7 +132,7 @@ def build_node_feature_table(
                       lambda: ff.compute_temporal_flow_features(df, source_col, target_col, amount_col, timestamp_col))
     # temporal is a dict of 3 DataFrames -- cache_pickle (not cache_parquet) handles that natively
 
-    tables = [leiden_node_table, local_stats, dispense, sink, passthrough]
+    tables = [leiden_node_table, dispense, sink, passthrough]
     tables += [t for t in temporal.values() if not t.empty]
     node_table = pd.concat(tables, axis=1, join="outer")
 

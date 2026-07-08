@@ -78,7 +78,16 @@ def _build_member_row_index(df: pd.DataFrame, source_col: str, target_col: str) 
 def _network_properties(sub_edges: pd.DataFrame) -> dict:
     if sub_edges.empty:
         return {}
-    graph = ig.Graph.DataFrame(sub_edges[["source", "target"]], directed=True, use_vids=False)
+    edge_df = sub_edges[["source", "target"]].copy()
+
+    edge_df["source"] = edge_df["source"].astype(str)
+    edge_df["target"] = edge_df["target"].astype(str)
+
+    graph = ig.Graph.DataFrame(
+        edge_df,
+        directed=True,
+        use_vids=False,
+    )
     props = {"num_nodes": graph.vcount(), "num_edges": graph.ecount(), "density": graph.density(loops=False)}
     degrees_all = graph.degree(mode="all")
     props["max_degree"] = max(degrees_all) if degrees_all else 0
