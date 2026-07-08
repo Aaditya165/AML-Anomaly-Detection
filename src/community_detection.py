@@ -80,8 +80,25 @@ def _network_properties(sub_edges: pd.DataFrame) -> dict:
         return {}
     edge_df = sub_edges[["source", "target"]].copy()
 
+    print("=" * 80)
+    print(edge_df.dtypes)
+    print(edge_df.head())
+    print(edge_df.isna().sum())
+
+    print("source type:", type(edge_df.iloc[0]["source"]))
+    print("target type:", type(edge_df.iloc[0]["target"]))
+
+    print("Unique source types:",
+          {type(x) for x in edge_df["source"].head(20)})
+    print("Unique target types:",
+          {type(x) for x in edge_df["target"].head(20)})
+
     edge_df["source"] = edge_df["source"].astype(str)
     edge_df["target"] = edge_df["target"].astype(str)
+
+    print("After astype(str):")
+    print(type(edge_df.iloc[0]["source"]))
+    print(type(edge_df.iloc[0]["target"]))
 
     graph = ig.Graph.DataFrame(
         edge_df,
@@ -157,7 +174,10 @@ def _one_community(key, members: Iterable[str], df_reset: pd.DataFrame, member_r
     position_arrays = [member_rows[m] for m in members if m in member_rows]
     if not position_arrays:
         return key, {}
-    candidate_positions = np.unique(np.concatenate(position_arrays))
+    candidate_positions = np.fromiter(
+        set().union(*(arr.tolist() for arr in position_arrays)),
+        dtype=np.int64,
+    )
     sub = df_reset.iloc[candidate_positions]
     mask = sub["source"].isin(members).to_numpy() & sub["target"].isin(members).to_numpy()
     sub = sub.loc[mask]
@@ -168,7 +188,24 @@ def _one_community(key, members: Iterable[str], df_reset: pd.DataFrame, member_r
         "num_sink_members": len(members & sink_only),
         "num_passthrough_members": len(members & passthrough_set),
     }
-    row.update(_network_properties(sub))
+    if len(members) <= config.MAX_GRAPH_METRICS_COMMUNITY_SIZE:
+        row.update(_network_properties(sub))
+    else:
+        row.update({
+            "num_nodes": np.nan,
+            "num_edges": np.nan,
+            "density": np.nan,
+            "max_degree": np.nan,
+            "max_degree_in": np.nan,
+            "max_degree_out": np.nan,
+            "assortativity_degree": np.nan,
+            "assortativity_degree_ud": np.nan,
+            "diameter": np.nan,
+            "diameter_ud": np.nan,
+            "num_biconn_components": np.nan,
+            "num_articulation_points": np.nan,
+        })
+
     row.update(_turnover_stats(sub))
     row.update(_weighted_time_stats(sub))
     return key, row
@@ -181,7 +218,7 @@ def compute_community_statistics(
     target_col: str = "Receiver Account",
     amount_col: str = "Amount Paid",
     timestamp_col: str = "Timestamp",
-    n_jobs: int = -1,
+    n_jobs: int = 1,
     prefix: str = "community",
 ) -> pd.DataFrame:
     """

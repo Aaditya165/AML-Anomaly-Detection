@@ -20,6 +20,9 @@ dedicated to exactly this job, and this codebase runs on a single machine
 
 SEED = 42
 
+MAX_GRAPH_METRICS_COMMUNITY_SIZE = 5000
+#to prevent memory blowup when computing graph metrics on the largest communities
+
 # --- Section 4.1 Community Detection ---
 LEIDEN_N_ITERATIONS = 100
 
