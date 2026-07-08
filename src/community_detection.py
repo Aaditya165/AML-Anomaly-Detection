@@ -79,26 +79,8 @@ def _network_properties(sub_edges: pd.DataFrame) -> dict:
     if sub_edges.empty:
         return {}
     edge_df = sub_edges[["source", "target"]].copy()
-
-    print("=" * 80)
-    print(edge_df.dtypes)
-    print(edge_df.head())
-    print(edge_df.isna().sum())
-
-    print("source type:", type(edge_df.iloc[0]["source"]))
-    print("target type:", type(edge_df.iloc[0]["target"]))
-
-    print("Unique source types:",
-          {type(x) for x in edge_df["source"].head(20)})
-    print("Unique target types:",
-          {type(x) for x in edge_df["target"].head(20)})
-
     edge_df["source"] = edge_df["source"].astype(str)
     edge_df["target"] = edge_df["target"].astype(str)
-
-    print("After astype(str):")
-    print(type(edge_df.iloc[0]["source"]))
-    print(type(edge_df.iloc[0]["target"]))
 
     graph = ig.Graph.DataFrame(
         edge_df,
@@ -174,10 +156,14 @@ def _one_community(key, members: Iterable[str], df_reset: pd.DataFrame, member_r
     position_arrays = [member_rows[m] for m in members if m in member_rows]
     if not position_arrays:
         return key, {}
-    candidate_positions = np.fromiter(
-        set().union(*(arr.tolist() for arr in position_arrays)),
-        dtype=np.int64,
-    )
+    # Vectorized (numpy-only) union of row positions -- NOT
+    # `set().union(*(arr.tolist() for arr in position_arrays))`. The
+    # Python-level version has to materialize every member's position
+    # array as a boxed-int Python list simultaneously (via *args
+    # unpacking) before union even starts, which is fine for a
+    # 2-member community and a genuine OOM risk for a 30,000-member one
+    # built around a hub account touching a large fraction of the file.
+    candidate_positions = np.unique(np.concatenate(position_arrays))
     sub = df_reset.iloc[candidate_positions]
     mask = sub["source"].isin(members).to_numpy() & sub["target"].isin(members).to_numpy()
     sub = sub.loc[mask]
@@ -206,8 +192,20 @@ def _one_community(key, members: Iterable[str], df_reset: pd.DataFrame, member_r
             "num_articulation_points": np.nan,
         })
 
-    row.update(_turnover_stats(sub))
-    row.update(_weighted_time_stats(sub))
+    # Same size gate as graph metrics -- `sub` for an oversized community
+    # can itself be a large fraction of the whole transaction table (a
+    # hub-dominated 30k-account community plausibly touches millions of
+    # rows), and groupby/sort/argsort over that, repeated across several
+    # oversized communities in the same run, adds up fast. Unlike graph
+    # metrics these are cheap to *approximate* instead of skip: sample
+    # down to a bounded number of rows rather than NaN them out entirely.
+    if len(sub) > config.MAX_TURNOVER_STATS_ROWS:
+        sub_for_stats = sub.sample(n=config.MAX_TURNOVER_STATS_ROWS, random_state=config.SEED)
+    else:
+        sub_for_stats = sub
+
+    row.update(_turnover_stats(sub_for_stats))
+    row.update(_weighted_time_stats(sub_for_stats))
     return key, row
 
 

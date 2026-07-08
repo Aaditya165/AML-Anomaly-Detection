@@ -22,6 +22,20 @@ SEED = 42
 
 MAX_GRAPH_METRICS_COMMUNITY_SIZE = 5000
 #to prevent memory blowup when computing graph metrics on the largest communities
+# Real Leiden output on the IBM-Small file: only 16/34,616 communities
+# exceed 1000 members, only 8 exceed 5000 -- diameter/assortativity/
+# biconnected_components are still expensive well before 5000 members if
+# the community is dense (plausible for anything hub-adjacent), so if
+# _network_properties is still slow, drop this to ~1000-2000 rather than
+# assuming 5000 is automatically safe.
+
+# turnover/weighted-time stats are NOT graph-topology metrics (no igraph
+# object involved) but still run over every transaction row belonging to
+# a community, uncapped -- for an oversized, hub-dominated community that
+# can itself be a large fraction of the whole file. Sampled down to this
+# many rows rather than skipped outright (unlike graph metrics, an
+# amount/turnover estimate from a large random sample is still meaningful).
+MAX_TURNOVER_STATS_ROWS = 200_000
 
 # --- Section 4.1 Community Detection ---
 LEIDEN_N_ITERATIONS = 100
