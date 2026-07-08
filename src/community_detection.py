@@ -220,27 +220,102 @@ def compute_community_statistics(
     prefix: str = "community",
 ) -> pd.DataFrame:
     """
-    `communities`: {key: iterable(member_account_ids)}. Works for BOTH
-    community views:
-      * Leiden      -> invert {account: community_id} into
-                       {community_id: {members}} first (this module's
-                       `leiden_communities` + a groupby), then broadcast
-                       each community's row back onto its members
-                       (feature_merge.py does this broadcast).
-
-    Returns a DataFrame indexed by `key`, columns prefixed `{prefix}_`.
+    Calculates statistics for communities. Automatically routes non-overlapping
+    communities (Leiden) to a memory-efficient global Pandas groupby, bypassing
+    the row-level concatenation that causes OOMs on massive hub communities.
     """
     df_reset = df[[source_col, target_col, amount_col, timestamp_col]].reset_index(drop=True)
     df_reset = df_reset.rename(
         columns={source_col: "source", target_col: "target", amount_col: "amount", timestamp_col: "timestamp"}
     )
-    member_rows = _build_member_row_index(df_reset, "source", "target")
+    
+    # Coerce to string so dict lookups match the graph vertex names exactly
+    df_reset["source"] = df_reset["source"].astype(str)
+    df_reset["target"] = df_reset["target"].astype(str)
+    
     dispense_only, sink_only, passthrough_set = _classify_node_types(df_reset["source"], df_reset["target"])
 
-    results = Parallel(n_jobs=n_jobs, prefer="threads")(
-        delayed(_one_community)(key, members, df_reset, member_rows, dispense_only, sink_only, passthrough_set)
-        for key, members in communities.items()
-    )
+    # Check if communities are non-overlapping (Leiden) to use the Fast Path
+    node_to_comm = {}
+    is_overlapping = False
+    for c_id, members in communities.items():
+        for m in members:
+            if m in node_to_comm:
+                is_overlapping = True
+                break
+            node_to_comm[m] = c_id
+        if is_overlapping:
+            break
+            
+    if not is_overlapping:
+        # =================================================================
+        # FAST PATH: Non-overlapping (Leiden)
+        # Eliminates OOM by globally identifying internal edges in pandas
+        # =================================================================
+        print("Executing memory-optimized Fast Path for non-overlapping communities...")
+        df_reset["source_comm"] = df_reset["source"].map(node_to_comm)
+        df_reset["target_comm"] = df_reset["target"].map(node_to_comm)
+        
+        # Keep only edges where source and target are in the same community
+        internal_edges = df_reset[
+            (df_reset["source_comm"] == df_reset["target_comm"]) & 
+            (df_reset["source_comm"].notna())
+        ]
+        grouped_internal = internal_edges.groupby("source_comm")
+        
+        def _fast_one(key, members):
+            members = set(members)
+            if not members:
+                return key, {}
+                
+            try:
+                sub = grouped_internal.get_group(key)
+            except KeyError:
+                sub = pd.DataFrame(columns=["source", "target", "amount", "timestamp"])
+                
+            row = {
+                "community_size": len(members),
+                "num_dispense_members": len(members & dispense_only),
+                "num_sink_members": len(members & sink_only),
+                "num_passthrough_members": len(members & passthrough_set),
+            }
+            
+            if len(members) <= config.MAX_GRAPH_METRICS_COMMUNITY_SIZE:
+                row.update(_network_properties(sub))
+            else:
+                row.update({
+                    "num_nodes": np.nan, "num_edges": np.nan, "density": np.nan,
+                    "max_degree": np.nan, "max_degree_in": np.nan, "max_degree_out": np.nan,
+                    "assortativity_degree": np.nan, "assortativity_degree_ud": np.nan,
+                    "diameter": np.nan, "diameter_ud": np.nan,
+                    "num_biconn_components": np.nan, "num_articulation_points": np.nan,
+                })
+
+            if len(sub) > config.MAX_TURNOVER_STATS_ROWS:
+                sub_for_stats = sub.sample(n=config.MAX_TURNOVER_STATS_ROWS, random_state=config.SEED)
+            else:
+                sub_for_stats = sub
+
+            row.update(_turnover_stats(sub_for_stats))
+            row.update(_weighted_time_stats(sub_for_stats))
+            return key, row
+
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_fast_one)(key, members) for key, members in communities.items()
+        )
+        
+    else:
+        # =================================================================
+        # SLOW PATH: Overlapping (Random Walks)
+        # Uses original row-index intersection logic
+        # =================================================================
+        print("Executing standard extraction for overlapping communities...")
+        member_rows = _build_member_row_index(df_reset, "source", "target")
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_one_community)(key, members, df_reset, member_rows, dispense_only, sink_only, passthrough_set)
+            for key, members in communities.items()
+        )
+        
     rows = {key: feats for key, feats in results if feats}
     out = pd.DataFrame.from_dict(rows, orient="index")
     if not out.empty:
