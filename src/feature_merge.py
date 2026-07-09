@@ -27,7 +27,6 @@ Also owns:
 
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import gc
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
@@ -112,11 +111,6 @@ def build_node_feature_table(
 
     # --- communities ---
     leiden_membership = _load(community_cache_dir / f"leiden_{key}.pkl", lambda: cd.leiden_communities(graph))
-    # `graph` (an igraph object over all ~417k accounts) is only needed by
-    # Leiden. If it was just computed (cache miss) it's live now; free it
-    # before the flow stage rather than holding it to function end.
-    del graph
-    gc.collect()
 
     # --- community statistics ---
     leiden_groups = cd.leiden_groups_from_membership(leiden_membership)
@@ -126,7 +120,6 @@ def build_node_feature_table(
         kind="parquet",
     )
     leiden_node_table = cd.broadcast_leiden_features(leiden_membership, leiden_stats)
-    del leiden_groups, leiden_stats, leiden_membership
 
     # --- flow features ---
     dispense = _load(feature_cache_dir / f"flow_dispense_{key}.parquet",
@@ -138,19 +131,10 @@ def build_node_feature_table(
     temporal = _load(feature_cache_dir / f"flow_temporal_{key}.pkl",
                       lambda: ff.compute_temporal_flow_features(df, source_col, target_col, amount_col, timestamp_col))
     # temporal is a dict of 3 DataFrames -- cache_pickle (not cache_parquet) handles that natively
-    del edges_agg  # dead after the three flow features above
-    gc.collect()
 
     tables = [leiden_node_table, dispense, sink, passthrough]
     tables += [t for t in temporal.values() if not t.empty]
     node_table = pd.concat(tables, axis=1, join="outer")
-    del tables, leiden_node_table, dispense, sink, passthrough, temporal
-
-    # float32 at the account level: 417k rows x ~134 cols halves from
-    # ~450MB to ~225MB here, and -- more importantly -- everything built
-    # FROM this table downstream (the transaction-level join, X_train,
-    # the anomaly fit input) inherits the smaller dtype.
-    node_table = node_table.astype(np.float32)
 
     if target_accounts is not None:
         node_table = node_table.reindex(target_accounts)
@@ -178,27 +162,17 @@ def join_node_features_to_transactions(
     `target_prefix`). Missing accounts get 0 rather than NaN.
 
     MEMORY NOTE: this fans ~270 account-level columns out onto millions of
-    transaction rows -- at HI-Small scale (~4.3M train rows) it is the
-    single largest allocation in the whole pipeline, and the previous
-    merge-based implementation OOM'd Kaggle at exactly this point. Three
-    changes keep the peak roughly half of what it was (verified ~1.9x on
-    a 300k-row benchmark, identical output to float32 precision):
-
-      1. float32, applied at the ACCOUNT level (417k rows -- cheap) so
-         every transaction-level block is BORN float32 instead of being
-         built float64 and (never) downcast. Halves every allocation.
+    transaction rows -- the single largest allocation in the pipeline, and
+    the previous merge-based version OOM'd here. Three changes roughly
+    halve peak memory (verified, output identical to float32 precision):
+      1. float32, applied at the ACCOUNT level (~417k rows, cheap) so
+         every transaction-level block is BORN float32.
       2. `.take()` on the node-feature array instead of two `df.merge`
-         calls followed by `out[new_cols].fillna(0.0)` -- the fillna on a
-         ~270-column block was a full transient copy of the block, and
-         each merge builds its own intermediate frame. The take-based
-         path fills missing accounts and NaN feature values in place.
-      3. ONE final `pd.concat` producing an already-contiguous frame --
-         which also removes the need for the old `return out.copy()`
-         de-fragmentation step (a full copy of everything, base columns
-         included) that pandas' fragmentation warning had pushed us into.
+         calls + a full-block `fillna` copy -- missing accounts and NaN
+         feature values are filled in place.
+      3. ONE final `pd.concat` producing an already-contiguous frame,
+         removing the old `return out.copy()` de-fragmentation copy.
     """
-    # float32 once, at account level; also hoist the ndarray out of the
-    # per-block closure so it's materialized once, not once per side.
     nf = node_features.astype(np.float32)
     nf_array = nf.to_numpy()
     position = pd.Series(np.arange(len(nf), dtype=np.int64), index=nf.index)
@@ -255,12 +229,10 @@ def prepare_feature_frame(df: pd.DataFrame, numeric_cols: List[str], categorical
     natively); numeric columns coerced to float32 with NaN -> 0.
 
     MEMORY NOTE: float32, not float64 -- XGBoost converts to float32
-    internally anyway, so float64 here only doubles this frame's size
-    (~5GB extra at HI-Small scale) for zero precision benefit. Columns
-    that are ALREADY float32 (every src_exq_/dst_exq_/exq_ column, after
-    the join rewrite above) are left untouched instead of being pushed
-    through a redundant to_numeric copy -- at ~270 such columns, that
-    skipped pass is most of this function's former cost."""
+    internally anyway, so float64 here only doubles this frame's size for
+    no precision benefit. Columns already float32 (every src_exq_/dst_exq_/
+    exq_ column after the join rewrite) are left untouched rather than
+    pushed through a redundant to_numeric copy."""
     X = df.loc[:, numeric_cols + categorical_cols].copy()
     for col in categorical_cols:
         X[col] = X[col].astype("category")

@@ -14,7 +14,6 @@ training, never anything from their own period. `evaluate()` documents
 the same pattern for a genuine held-out file.
 """
 
-import gc
 from typing import List, Optional
 
 import numpy as np
@@ -98,25 +97,11 @@ def train(
         list(node_features.columns), base_numeric_columns or [], base_categorical_columns or [],
     )
     X_train = fm.prepare_feature_frame(train_joined, numeric_cols, categorical_cols)
-    y_train = train_joined[label_col].to_numpy()
-    # train_joined is ~270 extra float32 columns on ~4.3M rows (several GB)
-    # and nothing below needs it once X_train + y_train exist -- free it
-    # BEFORE building X_val and the two DMatrix copies inside fit(), which
-    # is where peak memory actually lands. (val_joined stays: it's ~6x
-    # smaller and gets returned as df_val_joined for aggregation/SHAP.)
-    del train_joined
-    gc.collect()
-
     X_val = fm.prepare_feature_frame(val_joined, numeric_cols, categorical_cols)
-    y_val = val_joined[label_col].to_numpy()
+    y_train, y_val = train_joined[label_col].to_numpy(), val_joined[label_col].to_numpy()
 
     model = Model().fit(X_train, y_train, X_val, y_val)
-    del X_train
-    gc.collect()
-
     val_probs = model.predict_proba(X_val)
-    del X_val
-    gc.collect()
     threshold, _ = find_optimal_threshold(y_val, val_probs)
     metrics = evaluate(y_val, val_probs, threshold=threshold)
 
@@ -141,15 +126,37 @@ def score_holdout(
     source_col: str = "Sender Account", target_col: str = "Receiver Account",
     amount_col: str = "Amount Paid", timestamp_col: str = "Timestamp", label_col: str = "label",
     use_cache: bool = True,
+    build_features_from_holdout: bool = False,
 ) -> dict:
-    """Scores a genuine held-out file, rebuilding node features from
-    `df_train_plus_val` first so the held-out transactions never
-    influence their own community/flow features (same pattern `train()`
-    uses for validation, just one split further out)."""
+    """Scores a genuine held-out file.
+
+    Two regimes, controlled by `build_features_from_holdout`:
+
+    * `False` (default): node features are built from `df_train_plus_val`
+      and joined onto `df_holdout`. Correct when the holdout is a LATER
+      TIME SLICE OF THE SAME ACCOUNT POPULATION (accounts overlap heavily),
+      because it prevents the holdout's own transactions from leaking into
+      their features.
+
+    * `True`: node features are built from `df_holdout` ITSELF. Correct when
+      the holdout is a DIFFERENT ACCOUNT POPULATION (e.g. IBM LI scored by a
+      model trained on HI -- the two files share ~1% of accounts). In that
+      case there is no leakage risk (disjoint accounts), and building from
+      train+val instead would leave ~96% of holdout transactions with all
+      their ExSTraQt features zero-filled, since their accounts never appear
+      in the train+val node table. `df_train_plus_val` is ignored in this
+      regime.
+
+    If you're unsure which applies, check account overlap between the two
+    files first (Jaccard on the union of sender+receiver accounts). Low
+    overlap -> use `build_features_from_holdout=True`.
+    """
+    feature_source_df = df_holdout if build_features_from_holdout else df_train_plus_val
+    node_cache_key = "holdout_selfbuilt" if build_features_from_holdout else "train_plus_val"
     node_features = fm.build_node_feature_table(
         graph_cache_dir, community_cache_dir, feature_cache_dir,
-        df_train_plus_val, source_col, target_col, amount_col, timestamp_col,
-        restrict_to_accounts=restrict_to_accounts, cache_key="train_plus_val", use_cache=use_cache,
+        feature_source_df, source_col, target_col, amount_col, timestamp_col,
+        restrict_to_accounts=restrict_to_accounts, cache_key=node_cache_key, use_cache=use_cache,
     )
     holdout_joined = fm.join_node_features_to_transactions(df_holdout, node_features, source_col, target_col)
     probs = predict(model, holdout_joined, feature_columns)
