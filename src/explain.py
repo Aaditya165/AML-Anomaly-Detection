@@ -24,53 +24,102 @@ import shap
 import xgboost as xgb
 
 
-def build_explainer(booster: xgb.Booster) -> shap.TreeExplainer:
-    """One explainer, reusable across summary/transaction/dependence calls
-    -- building it is the relatively expensive part (walks the trees
-    once); computing SHAP values for a given X is comparatively cheap."""
-    return shap.TreeExplainer(booster)
+def build_explainer(booster: xgb.Booster) -> xgb.Booster:
+    """
+    Native XGBoost TreeSHAP.
+    The booster itself is all we need.
+    """
+    return booster
 
 
-def shap_values(explainer: shap.TreeExplainer, X: pd.DataFrame) -> np.ndarray:
-    """Raw per-row, per-feature SHAP values, shape (n_rows, n_features).
-    Every other function in this module is a view over this array --
-    compute it once per X and reuse, rather than recomputing per call."""
-    dmatrix = xgb.DMatrix(X, enable_categorical=True)
-    return explainer.shap_values(dmatrix)
+def shap_values(
+    booster: xgb.Booster,
+    X: pd.DataFrame,
+) -> np.ndarray:
+    """
+    Native TreeSHAP from XGBoost.
+
+    Returns
+    -------
+    ndarray of shape (n_rows, n_features)
+    """
+
+    dmatrix = xgb.DMatrix(
+        X,
+        enable_categorical=True,
+        feature_names=list(X.columns),
+    )
+
+    contribs = booster.predict(
+        dmatrix,
+        pred_contribs=True,
+    )
+
+    # Last column is the bias term.
+    return contribs[:, :-1]
 
 
-def summary(explainer: shap.TreeExplainer, X: pd.DataFrame, max_display: int = 20) -> pd.DataFrame:
-    """Global view: mean |SHAP value| per feature, sorted descending --
-    the SHAP analogue of model.feature_importance(), but derived from
-    actual per-prediction attributions rather than the booster's internal
-    gain accounting (the two usually agree on the big picture, but SHAP's
-    ranking is the one that's actually consistent with what
-    explain_transaction() shows for any individual row)."""
-    values = shap_values(explainer, X)
-    mean_abs = np.abs(values).mean(axis=0)
-    out = pd.DataFrame({"feature": X.columns, "mean_abs_shap": mean_abs})
-    out = out.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
-    return out.head(max_display) if max_display else out
+def summary(
+    booster,
+    X: pd.DataFrame,
+    max_display: int = 20,
+):
+    values = shap_values(booster, X)
+
+    importance = (
+        np.abs(values)
+        .mean(axis=0)
+    )
+
+    out = pd.DataFrame({
+        "feature": X.columns,
+        "mean_abs_shap": importance,
+    })
+
+    out = out.sort_values(
+        "mean_abs_shap",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    if max_display:
+        out = out.head(max_display)
+
+    return out
 
 
 def explain_transaction(
-    explainer: shap.TreeExplainer, X: pd.DataFrame, row_index, top_n: int = 15
-) -> pd.DataFrame:
-    """Per-transaction explanation ('waterfall' data, not the plot itself
-    -- see `waterfall_plot_data` if you want to hand this straight to
-    `shap.plots.waterfall`): for one row, the top features pushing the
-    score up or down, with their SHAP value and the row's own feature
-    value alongside it (so "relay_timing_score = 0.9, contributing +0.31"
-    reads the way an investigator would want it to).
-    """
-    row = X.loc[[row_index]] if row_index in X.index else X.iloc[[row_index]]
-    values = shap_values(explainer, row)[0]
+    booster,
+    X: pd.DataFrame,
+    row_index,
+    top_n: int = 15,
+):
+    if row_index in X.index:
+        row = X.loc[[row_index]]
+    else:
+        row = X.iloc[[row_index]]
+
+    values = shap_values(booster, row)[0]
+
     out = pd.DataFrame({
-        "feature": X.columns, "feature_value": row.iloc[0].to_numpy(), "shap_value": values,
+        "feature": X.columns,
+        "feature_value": row.iloc[0].values,
+        "shap_value": values,
     })
-    out["abs_shap_value"] = out["shap_value"].abs()
-    out = out.sort_values("abs_shap_value", ascending=False).drop(columns="abs_shap_value")
-    return out.head(top_n) if top_n else out
+
+    out["abs_shap"] = out["shap_value"].abs()
+
+    out = (
+        out.sort_values(
+            "abs_shap",
+            ascending=False,
+        )
+        .drop(columns="abs_shap")
+    )
+
+    if top_n:
+        out = out.head(top_n)
+
+    return out
 
 
 def waterfall_plot_data(explainer: shap.TreeExplainer, X: pd.DataFrame, row_index) -> shap.Explanation:
