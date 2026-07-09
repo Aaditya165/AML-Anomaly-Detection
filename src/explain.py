@@ -35,7 +35,8 @@ def shap_values(explainer: shap.TreeExplainer, X: pd.DataFrame) -> np.ndarray:
     """Raw per-row, per-feature SHAP values, shape (n_rows, n_features).
     Every other function in this module is a view over this array --
     compute it once per X and reuse, rather than recomputing per call."""
-    return explainer.shap_values(X)
+    dmatrix = xgb.DMatrix(X, enable_categorical=True)
+    return explainer.shap_values(dmatrix)
 
 
 def summary(explainer: shap.TreeExplainer, X: pd.DataFrame, max_display: int = 20) -> pd.DataFrame:
