@@ -51,8 +51,6 @@ NUMERIC_FEATURE_COLUMNS = [
 ]
 
 CATEGORICAL_FEATURE_COLUMNS = [
-    "from_bank_idx",
-    "to_bank_idx",
     "payment_format_idx",
     "payment_currency_idx",
     "receiving_currency_idx",

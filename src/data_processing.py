@@ -7,12 +7,19 @@ Loads the raw IBM-AML-format CSV and produces a clean, typed DataFrame
 ready for graph construction. Wrapped in Timer() so load+clean cost is
 visible in the final timing report.
 
-Categorical vocabularies (account / bank / payment format / currency) are
-fit ONCE on the training file and reused on the test file, with an
-explicit "unknown" bucket for any account/bank/etc. that only appears in
-test data -- otherwise train and test embedding indices wouldn't even
-refer to the same accounts, and a held-out account would crash an
-nn.Embedding lookup instead of degrading gracefully.
+Categorical vocabularies (bank / payment format / currency) are fit ONCE
+on the training file and reused on the test file, with an explicit
+"unknown" bucket for any bank/format/currency that only appears in test
+data -- these feed the model directly as categorical columns, so they
+must stay aligned with what the model learned. The "account" vocabulary
+(sender_idx/receiver_idx) is the deliberate exception: it is refit fresh
+on EVERY file, because those codes are only used internally as fast
+grouping keys for graph construction and behavioral profiling, never fed
+to the model -- reusing a fixed account vocab across files would collapse
+every unseen account into one shared "unknown" code, which isn't a
+graceful degradation but an identity collision (unrelated accounts become
+indistinguishable to the graph/behavioral code). See the comment at the
+CATEGORICAL_GROUPS loop below for the full reasoning.
 """
 
 import numpy as np
@@ -166,11 +173,33 @@ def load_and_clean(csv_path: str, vocabs: dict = None):
     # an already-`category`-dtype column only has to map the small set
     # of unique categories, not every row -- another free speedup from
     # the dtype change above.
+    #
+    # EXCEPTION: "account". sender_idx/receiver_idx are NOT fed to the
+    # model (base_feature_columns.py deliberately excludes them) -- they
+    # only exist as fast internal grouping keys for graph construction
+    # (graph_construction.py) and the account-behavior profiler
+    # (feature_engineering.py's add_account_context_features). For that
+    # purpose what matters is that codes are consistent WITHIN one file,
+    # not ACROSS files. Reusing train's account vocab on a different file
+    # sends every previously-unseen account to the SAME shared "unknown"
+    # code -- not a graceful degradation but an identity collision: two
+    # unrelated real accounts become indistinguishable to the graph and
+    # behavioral-profile code, producing fake edges and corrupted,
+    # blended behavioral stats rather than merely missing ones. So
+    # "account" is always refit fresh per file, train or test, regardless
+    # of what's in `vocabs` -- this is safe specifically because nothing
+    # downstream needs train/test account codes to line up (that
+    # requirement was for an earlier GNN architecture that indexed a
+    # learned embedding table; it doesn't apply to a tree model with
+    # identity excluded from the feature set). Bank/payment-format/
+    # currency vocabs keep the original reuse-from-train behavior, since
+    # those DO feed the model directly as categorical features and must
+    # stay aligned with what the model learned.
     fit_mode = vocabs is None
     if fit_mode:
         vocabs = {}
     for group, cols in CATEGORICAL_GROUPS.items():
-        if fit_mode:
+        if fit_mode or group == "account":
             vocabs[group] = build_vocab([df[c] for c, _ in cols])
         for raw_col, out_col in cols:
             df[out_col] = apply_vocab(df[raw_col], vocabs[group])
