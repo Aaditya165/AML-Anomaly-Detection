@@ -136,7 +136,15 @@ def train(
     return {
         "model": model, "node_features": node_features, "threshold": threshold, "metrics": metrics,
         "val_probs": val_probs, "df_val_joined": df_val_joined,
-        "feature_columns": {"numeric": numeric_cols, "categorical": categorical_cols},
+        "feature_columns": {
+            "numeric": numeric_cols, "categorical": categorical_cols,
+            # RAW base-only lists (pre exq-expansion) -- score_holdout needs
+            # these to call build_model_matrix directly instead of the fat
+            # join+prepare path. "numeric"/"categorical" above stay as the
+            # combined lists prepare_feature_frame expects, for anything
+            # still using that path.
+            "base_numeric": base_numeric, "base_categorical": base_categorical,
+        },
     }
 
 
@@ -170,14 +178,31 @@ def score_holdout(
       the holdout is a DIFFERENT ACCOUNT POPULATION (e.g. IBM LI scored by a
       model trained on HI -- the two files share ~1% of accounts). In that
       case there is no leakage risk (disjoint accounts), and building from
-      train+val instead would leave ~96% of holdout transactions with all
-      their ExSTraQt features zero-filled, since their accounts never appear
-      in the train+val node table. `df_train_plus_val` is ignored in this
-      regime.
+      train+val instead would leave the vast majority of holdout
+      transactions with all their ExSTraQt features zero-filled, since
+      their accounts never appear in the train+val node table.
+      `df_train_plus_val` is ignored in this regime.
 
     If you're unsure which applies, check account overlap between the two
     files first (Jaccard on the union of sender+receiver accounts). Low
     overlap -> use `build_features_from_holdout=True`.
+
+    MEMORY NOTE: builds the model matrix X DIRECTLY via
+    `feature_merge.build_model_matrix`, the same way `train()` does --
+    never materializes the fat "full df_holdout + ~270 exq columns" frame
+    that `join_node_features_to_transactions` + `prepare_feature_frame`
+    would. Only requires `feature_columns["base_numeric"]` /
+    `["base_categorical"]` (added to what `train()` returns) -- if you're
+    passing an older `feature_columns` dict that only has "numeric"/
+    "categorical", this falls back to the old (fatter, slower) path
+    automatically, with a printed warning.
+
+    Returns `df_holdout_view` instead of a fat `df_holdout_joined`: just
+    the 5 columns aggregation.py's `build_transaction_view`/
+    `aggregate_accounts` actually read (txn_id, Sender Account,
+    Receiver Account, Amount Paid, Timestamp) -- not the full engineered
+    frame. `df_holdout_joined` is kept as an alias to the same slim frame
+    for backward compatibility with existing notebook cells.
     """
     feature_source_df = df_holdout if build_features_from_holdout else df_train_plus_val
     node_cache_key = "holdout_selfbuilt" if build_features_from_holdout else "train_plus_val"
@@ -186,10 +211,37 @@ def score_holdout(
         feature_source_df, source_col, target_col, amount_col, timestamp_col,
         restrict_to_accounts=restrict_to_accounts, cache_key=node_cache_key, use_cache=use_cache,
     )
-    holdout_joined = fm.join_node_features_to_transactions(df_holdout, node_features, source_col, target_col)
-    probs = predict(model, holdout_joined, feature_columns)
-    metrics = evaluate(holdout_joined[label_col].to_numpy(), probs, threshold=threshold)
-    return {"node_features": node_features, "probs": probs, "metrics": metrics, "df_holdout_joined": holdout_joined}
+
+    if "base_numeric" in feature_columns and "base_categorical" in feature_columns:
+        X_holdout = fm.build_model_matrix(
+            df_holdout, node_features,
+            feature_columns["base_numeric"], feature_columns["base_categorical"],
+            source_col, target_col,
+        )
+        probs = model.predict_proba(X_holdout)
+        del X_holdout
+        gc.collect()
+    else:
+        print("[score_holdout] feature_columns missing 'base_numeric'/'base_categorical' "
+              "(from an older train() run) -- falling back to the fatter join+prepare path. "
+              "Re-run train() to get the leaner one.")
+        holdout_joined = fm.join_node_features_to_transactions(df_holdout, node_features, source_col, target_col)
+        probs = predict(model, holdout_joined, feature_columns)
+        del holdout_joined
+        gc.collect()
+
+    metrics = evaluate(df_holdout[label_col].to_numpy(), probs, threshold=threshold)
+
+    # Slim view for aggregation.py -- only what build_transaction_view /
+    # aggregate_accounts actually read. NOT the fat exq-joined frame.
+    view_cols = [c for c in ["txn_id", source_col, target_col, amount_col, timestamp_col] if c in df_holdout.columns]
+    df_holdout_view = df_holdout.loc[:, view_cols].copy()
+
+    return {
+        "node_features": node_features, "probs": probs, "metrics": metrics,
+        "df_holdout_view": df_holdout_view,
+        "df_holdout_joined": df_holdout_view,  # alias, same slim frame -- see docstring
+    }
 
 
 def save_model(model: Model, path: str):
