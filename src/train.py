@@ -71,6 +71,7 @@ def train(
     timestamp_col: str = "Timestamp",
     label_col: str = "label",
     use_cache: bool = True,
+    return_val_joined: bool = False,
 ) -> dict:
     """
     `df`: output of data_processing.load_and_clean (optionally already run
@@ -108,6 +109,14 @@ def train(
         list(node_features.columns), base_numeric, base_categorical,
     )
 
+    # df_train / df_val are dead once the matrices + labels exist -- free
+    # them BEFORE fit() (which makes its own DMatrix copies of X_train/
+    # X_val). If df_val_joined is requested later, it's rebuilt from a
+    # kept slice; otherwise df_val goes too. df_train is never needed again.
+    keep_df_val = df_val if return_val_joined else None
+    del df_train, df_val
+    gc.collect()
+
     model = Model().fit(X_train, y_train, X_val, y_val)
     del X_train
     gc.collect()
@@ -119,10 +128,10 @@ def train(
     threshold, _ = find_optimal_threshold(y_val, val_probs)
     metrics = evaluate(y_val, val_probs, threshold=threshold)
 
-    # df_val_joined is only needed by the caller for aggregation/dashboard
-    # exports -- build the (fat) joined frame for VAL only, which is
-    # val_frac-sized (~15%), not for the big train split.
-    df_val_joined = fm.join_node_features_to_transactions(df_val, node_features, source_col, target_col)
+    if return_val_joined:
+        df_val_joined = fm.join_node_features_to_transactions(keep_df_val, node_features, source_col, target_col)
+    else:
+        df_val_joined = None
 
     return {
         "model": model, "node_features": node_features, "threshold": threshold, "metrics": metrics,
@@ -189,3 +198,36 @@ def save_model(model: Model, path: str):
 
 def load_model(path: str) -> Model:
     return Model.load(path)
+
+
+def save_run_artifacts(model_cache_dir, model: Model, threshold: float, feature_columns: dict):
+    """Persist the THREE small things the holdout / SHAP cells need but that
+    a kernel restart (e.g. after an OOM) would otherwise wipe: the model,
+    the tuned decision threshold, and the feature-column lists.
+
+    These are tiny (a few MB total) -- this is about surviving a restart,
+    NOT about reducing peak memory. Do NOT cache the fat frames
+    (df_val_joined etc.) here: those should be `del`'d after the SHAP cell,
+    not reloaded, since reloading them during the holdout step would put
+    the memory spike right back. See the holdout-cell notes.
+    """
+    from pathlib import Path
+    import json
+    model_cache_dir = Path(model_cache_dir)
+    model_cache_dir.mkdir(parents=True, exist_ok=True)
+    model.save(str(model_cache_dir / "exstraqt_model.json"))
+    with open(model_cache_dir / "run_meta.json", "w") as fl:
+        json.dump({"threshold": float(threshold), "feature_columns": feature_columns}, fl)
+
+
+def load_run_artifacts(model_cache_dir):
+    """Reload what save_run_artifacts wrote. Returns (model, threshold,
+    feature_columns) -- lets the holdout / SHAP cells run in a fresh kernel
+    without re-running training."""
+    from pathlib import Path
+    import json
+    model_cache_dir = Path(model_cache_dir)
+    model = Model.load(str(model_cache_dir / "exstraqt_model.json"))
+    with open(model_cache_dir / "run_meta.json") as fl:
+        meta = json.load(fl)
+    return model, meta["threshold"], meta["feature_columns"]
