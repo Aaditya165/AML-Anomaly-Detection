@@ -91,23 +91,22 @@ def train(
         restrict_to_accounts=restrict_to_accounts, cache_key="train", use_cache=use_cache,
     )
 
-    train_joined = fm.join_node_features_to_transactions(df_train, node_features, source_col, target_col)
-    val_joined = fm.join_node_features_to_transactions(df_val, node_features, source_col, target_col)
+    base_numeric = base_numeric_columns or []
+    base_categorical = base_categorical_columns or []
+
+    # Build X_train DIRECTLY -- no fat train_joined intermediate (see
+    # build_model_matrix). y from df_train before it's needed elsewhere.
+    X_train = fm.build_model_matrix(df_train, node_features, base_numeric, base_categorical,
+                                    source_col, target_col)
+    y_train = df_train[label_col].to_numpy()
+
+    X_val = fm.build_model_matrix(df_val, node_features, base_numeric, base_categorical,
+                                  source_col, target_col)
+    y_val = df_val[label_col].to_numpy()
 
     numeric_cols, categorical_cols = fm.all_feature_columns(
-        list(node_features.columns), base_numeric_columns or [], base_categorical_columns or [],
+        list(node_features.columns), base_numeric, base_categorical,
     )
-    X_train = fm.prepare_feature_frame(train_joined, numeric_cols, categorical_cols)
-    y_train = train_joined[label_col].to_numpy()
-    # train_joined is ~270 extra float32 cols on millions of rows (several GB)
-    # and nothing below needs it once X_train + y_train exist -- free it BEFORE
-    # building X_val and the two DMatrix copies inside fit(), which is where
-    # peak memory lands. (val_joined stays -- it's smaller and is returned.)
-    del train_joined
-    gc.collect()
-
-    X_val = fm.prepare_feature_frame(val_joined, numeric_cols, categorical_cols)
-    y_val = val_joined[label_col].to_numpy()
 
     model = Model().fit(X_train, y_train, X_val, y_val)
     del X_train
@@ -120,9 +119,14 @@ def train(
     threshold, _ = find_optimal_threshold(y_val, val_probs)
     metrics = evaluate(y_val, val_probs, threshold=threshold)
 
+    # df_val_joined is only needed by the caller for aggregation/dashboard
+    # exports -- build the (fat) joined frame for VAL only, which is
+    # val_frac-sized (~15%), not for the big train split.
+    df_val_joined = fm.join_node_features_to_transactions(df_val, node_features, source_col, target_col)
+
     return {
         "model": model, "node_features": node_features, "threshold": threshold, "metrics": metrics,
-        "val_probs": val_probs, "df_val_joined": val_joined,
+        "val_probs": val_probs, "df_val_joined": df_val_joined,
         "feature_columns": {"numeric": numeric_cols, "categorical": categorical_cols},
     }
 

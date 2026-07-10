@@ -204,6 +204,75 @@ def join_node_features_to_transactions(
     return pd.concat(parts, axis=1)
 
 
+def build_model_matrix(
+    df: pd.DataFrame,
+    node_features: pd.DataFrame,
+    base_numeric: List[str],
+    base_categorical: List[str],
+    source_col: str = "Sender Account",
+    target_col: str = "Receiver Account",
+    source_prefix: str = "src_exq_",
+    target_prefix: str = "dst_exq_",
+) -> pd.DataFrame:
+    """Memory-lean fusion of join + prepare_feature_frame: build the model
+    matrix X DIRECTLY, without ever materializing the fat `train_joined`
+    frame (full df + ~270 exq cols) that then gets sliced down.
+
+    The old two-step path held, simultaneously: `df` + `train_joined`
+    (all base cols + raw strings + timestamps + 270 exq cols) + `X`
+    (a near-complete numeric copy of that). At millions of rows this was
+    the pipeline's peak. Here we take ONLY the base columns the model uses
+    (`base_numeric` + `base_categorical`) straight from `df`, attach the
+    float32 exq blocks, and return that -- no raw string/timestamp/unused
+    columns are ever copied, and there's no second slicing pass.
+
+    Returns X ready for the model (categoricals as 'category' dtype,
+    numerics float32). Get y separately with `df[label_col].to_numpy()`.
+    """
+    nf = node_features.astype(np.float32)
+    nf_array = nf.to_numpy()
+    position = pd.Series(np.arange(len(nf), dtype=np.int64), index=nf.index)
+
+    def _block(accounts: pd.Series, prefix: str) -> pd.DataFrame:
+        idx = accounts.map(position)
+        missing = idx.isna().to_numpy()
+        idx_filled = idx.fillna(0).to_numpy(dtype=np.int64)
+        block = nf_array[idx_filled]
+        block[missing] = 0.0
+        np.nan_to_num(block, copy=False)
+        return pd.DataFrame(block, index=df.index,
+                            columns=[f"{prefix}{c}" for c in nf.columns])
+
+    src_block = _block(df[source_col], source_prefix)
+    dst_block = _block(df[target_col], target_prefix)
+
+    parts = []
+    # base numerics: pull only what the model uses, float32
+    if base_numeric:
+        base_num = df.loc[:, base_numeric].apply(pd.to_numeric, errors="coerce").astype(np.float32).fillna(0.0)
+        parts.append(base_num)
+    parts.append(src_block)
+    parts.append(dst_block)
+
+    if "anomaly_score" in nf.columns:
+        src_a = src_block[f"{source_prefix}anomaly_score"].to_numpy()
+        dst_a = dst_block[f"{target_prefix}anomaly_score"].to_numpy()
+        parts.append(pd.DataFrame({
+            "exq_anomaly_score_diff": src_a - dst_a,
+            "exq_anomaly_score_min": np.minimum(src_a, dst_a),
+            "exq_anomaly_score_max": np.maximum(src_a, dst_a),
+            "exq_anomaly_score_mean": (src_a + dst_a) / 2.0,
+        }, index=df.index))
+
+    X = pd.concat(parts, axis=1)
+
+    # base categoricals last: as 'category' dtype, small, appended in place
+    for col in base_categorical:
+        X[col] = df[col].astype("category")
+
+    return X
+
+
 # ---------------------------------------------------------------------------
 # Combined BASE + ExSTraQt feature-column registry
 # ---------------------------------------------------------------------------
