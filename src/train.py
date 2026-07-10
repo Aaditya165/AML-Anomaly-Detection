@@ -14,6 +14,7 @@ training, never anything from their own period. `evaluate()` documents
 the same pattern for a genuine held-out file.
 """
 
+import gc
 from typing import List, Optional
 
 import numpy as np
@@ -97,11 +98,25 @@ def train(
         list(node_features.columns), base_numeric_columns or [], base_categorical_columns or [],
     )
     X_train = fm.prepare_feature_frame(train_joined, numeric_cols, categorical_cols)
+    y_train = train_joined[label_col].to_numpy()
+    # train_joined is ~270 extra float32 cols on millions of rows (several GB)
+    # and nothing below needs it once X_train + y_train exist -- free it BEFORE
+    # building X_val and the two DMatrix copies inside fit(), which is where
+    # peak memory lands. (val_joined stays -- it's smaller and is returned.)
+    del train_joined
+    gc.collect()
+
     X_val = fm.prepare_feature_frame(val_joined, numeric_cols, categorical_cols)
-    y_train, y_val = train_joined[label_col].to_numpy(), val_joined[label_col].to_numpy()
+    y_val = val_joined[label_col].to_numpy()
 
     model = Model().fit(X_train, y_train, X_val, y_val)
+    del X_train
+    gc.collect()
+
     val_probs = model.predict_proba(X_val)
+    del X_val
+    gc.collect()
+
     threshold, _ = find_optimal_threshold(y_val, val_probs)
     metrics = evaluate(y_val, val_probs, threshold=threshold)
 
