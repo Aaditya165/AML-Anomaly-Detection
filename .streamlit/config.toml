@@ -1,0 +1,14 @@
+# Place this at:  <project_root>/.streamlit/config.toml
+#
+# Streamlit's default maxUploadSize is 200 MB, which the IBM AML files exceed
+# (HI-Small_Trans.csv is ~500 MB, LI-Small is larger). This raises it to 2 GB.
+#
+# Equivalent one-off command-line override:
+#     streamlit run dashboard/app.py --server.maxUploadSize=2048
+
+[server]
+maxUploadSize = 2048
+maxMessageSize = 2048
+
+[browser]
+gatherUsageStats = false
