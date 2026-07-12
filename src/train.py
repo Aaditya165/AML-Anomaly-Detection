@@ -163,6 +163,7 @@ def score_holdout(
     amount_col: str = "Amount Paid", timestamp_col: str = "Timestamp", label_col: str = "label",
     use_cache: bool = True,
     build_features_from_holdout: bool = False,
+    score_batch_size: Optional[int] = 500_000,
 ) -> dict:
     """Scores a genuine held-out file.
 
@@ -213,14 +214,40 @@ def score_holdout(
     )
 
     if "base_numeric" in feature_columns and "base_categorical" in feature_columns:
-        X_holdout = fm.build_model_matrix(
-            df_holdout, node_features,
-            feature_columns["base_numeric"], feature_columns["base_categorical"],
-            source_col, target_col,
-        )
-        probs = model.predict_proba(X_holdout)
-        del X_holdout
-        gc.collect()
+        # CHUNKED SCORING. Building X for the whole holdout at once needs the
+        # full matrix AND XGBoost's internal DMatrix copy of it alive at the
+        # same time -- at LI scale that's ~8.4 GB + ~8.4 GB on top of df_holdout,
+        # which is the OOM. Scoring in row-chunks means only ONE chunk's matrix
+        # (+ its DMatrix) exists at a time; we keep just the float32 probability
+        # array, which is ~28 MB for 7M rows. Predictions are row-independent,
+        # so this is numerically identical to scoring in one shot -- purely a
+        # memory optimization. `score_batch_size=None` restores the old
+        # all-at-once behaviour.
+        n = len(df_holdout)
+        if score_batch_size is None or score_batch_size >= n:
+            X_holdout = fm.build_model_matrix(
+                df_holdout, node_features,
+                feature_columns["base_numeric"], feature_columns["base_categorical"],
+                source_col, target_col,
+            )
+            probs = model.predict_proba(X_holdout)
+            del X_holdout
+            gc.collect()
+        else:
+            probs = np.empty(n, dtype=np.float32)
+            for start in range(0, n, score_batch_size):
+                end = min(start + score_batch_size, n)
+                chunk = df_holdout.iloc[start:end]
+                X_chunk = fm.build_model_matrix(
+                    chunk, node_features,
+                    feature_columns["base_numeric"], feature_columns["base_categorical"],
+                    source_col, target_col,
+                )
+                probs[start:end] = model.predict_proba(X_chunk)
+                del X_chunk, chunk
+                gc.collect()
+                print(f"  scored {end:,}/{n:,} rows", end="\r")
+            print()
     else:
         print("[score_holdout] feature_columns missing 'base_numeric'/'base_categorical' "
               "(from an older train() run) -- falling back to the fatter join+prepare path. "
