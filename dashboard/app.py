@@ -14,37 +14,31 @@ it -- see that file. You can also override on the command line:
 TWO MODES
 ---------
 1. "Instant (pre-computed)" -- loads exports/transaction_view.csv and
-   exports/account_view.csv that the notebook already wrote. Sub-second.
-   Use this if you need the demo to be immediate and you're showing
-   results, not the machinery.
+   exports/account_view.csv, whatever the notebook last wrote there.
+   Sub-second, but only shows whatever that last run happened to be.
 
-2. "Compute from uploaded CSV" -- runs the real pipeline on whatever you
-   upload, reusing the disk caches under cache/ so the genuinely expensive
-   stages (Leiden community detection ~72 min, community stats + flow
-   features ~10 min) are skipped entirely.
+2. "Compute from uploaded CSV" -- runs the REAL pipeline on WHATEVER file
+   you upload, fully from scratch every time. There is NO dependency on
+   any pre-built cache directory and no dataset-specific setting to pick
+   (the old version required manually choosing between two cache keys
+   that only ever matched two specific files -- HI-Small / LI-Small --
+   and silently produced garbage scores if you picked the wrong one or
+   uploaded a third file entirely). That's gone: the account graph,
+   community detection, and flow-tracing stages are recomputed from the
+   uploaded file's own transactions every single run, so whatever you
+   upload is guaranteed to be scored using ITS OWN features, correctly,
+   with no manual choice involved.
 
-   HONEST TIMING: even with every cache hit, this is NOT instant. These
-   stages are NOT cached and run on the uploaded file every time:
-       load_and_clean            ~35 s
-       build_transaction_graph   ~19 s
-       engineer_all_features    ~165 s   <-- the bulk
-       chunked scoring (6M rows) ~60-90 s
-   Budget ~4-5 minutes on an IBM *-Small file. The caches turn ~85 minutes
-   into ~5, which is the difference that matters -- but plan the demo
-   around 5 minutes, not 5 seconds.
-
-CACHE / UPLOAD CONSISTENCY (important)
---------------------------------------
-The cached artifacts are keyed by CACHE_KEY (sidebar). Each key's caches
-were built from ONE specific file's account graph:
-    "train_plus_val"     -> built from HI-Small_Trans.csv
-    "holdout_selfbuilt"  -> built from LI-Small_Trans.csv
-You must upload the file that MATCHES the selected key. Upload HI with the
-LI caches (or vice versa) and the account graph won't correspond to the
-uploaded transactions -- accounts won't be found in the node table, their
-ExSTraQt features silently become zeros, and the scores will be garbage.
-The app checks this by comparing the uploaded file's accounts against the
-cached node table and warns loudly if the overlap is low.
+HONEST TIMING: since nothing is cached, every run pays the full cost:
+    load_and_clean                    ~35 s   (scales with row count)
+    build_transaction_graph           ~19 s
+    engineer_all_features            ~165 s   <-- the bulk
+    account graph + Leiden + flows   minutes, scales with account count
+    scoring (chunked)                 varies with row count
+This is intentionally NOT the fast path -- it trades speed for the
+guarantee that results are always computed fresh from exactly what was
+uploaded. For an instant demo of already-seen results, use "Instant
+(pre-computed)" instead.
 """
 
 import gc
@@ -98,9 +92,9 @@ with st.sidebar:
     st.header("Mode")
     mode = st.radio(
         "How should results be produced?",
-        ["Instant (pre-computed exports)", "Compute from uploaded CSV"],
-        help="Instant loads the CSVs the notebook already wrote. Compute runs the "
-             "real pipeline on your upload, reusing disk caches.",
+        ["Compute from uploaded CSV", "Instant (pre-computed exports)"],
+        help="Compute runs the real pipeline, from scratch, on whatever you upload. "
+             "Instant loads the CSVs the notebook already wrote, whatever they are.",
     )
 
     st.divider()
@@ -108,21 +102,8 @@ with st.sidebar:
     risk_threshold = st.slider(
         "Risk score threshold", 0.0, 1.0, float(DEFAULT_THRESHOLD), 0.01,
         help="Transactions at or above this score are flagged. The tuned value from "
-             "the HI validation split was 0.6334.",
+             "the HI validation split was 0.6334 -- a reasonable default, adjust freely.",
     )
-
-    if mode == "Compute from uploaded CSV":
-        st.divider()
-        st.header("Cache")
-        cache_key = st.selectbox(
-            "Cached account graph to reuse",
-            ["train_plus_val", "holdout_selfbuilt"],
-            help="train_plus_val = built from HI-Small_Trans.csv. "
-                 "holdout_selfbuilt = built from LI-Small_Trans.csv. "
-                 "MUST match the file you upload.",
-        )
-        expected_file = "HI-Small_Trans.csv" if cache_key == "train_plus_val" else "LI-Small_Trans.csv"
-        st.info(f"Upload **{expected_file}** to match this cache key.")
 
 
 # ===========================================================================
@@ -143,8 +124,10 @@ def load_exported_views():
     return pd.read_csv(txn_p), pd.read_csv(acct_p)
 
 
-def compute_from_upload(uploaded_file, cache_key: str, threshold: float):
-    """Full pipeline on an uploaded CSV, reusing the disk caches."""
+def compute_from_upload(uploaded_file, threshold: float):
+    """Full pipeline on an uploaded CSV, computed entirely from scratch --
+    no dependency on any pre-built cache. Works on any file with the
+    expected IBM AML columns, not just a specific known dataset."""
     tmp_csv = Path(tempfile.gettempdir()) / uploaded_file.name
     with open(tmp_csv, "wb") as fh:
         fh.write(uploaded_file.getbuffer())
@@ -154,7 +137,7 @@ def compute_from_upload(uploaded_file, cache_key: str, threshold: float):
         st.error(f"No trained model at `{MODEL_PATH}`. Run the notebook's save-model cell first.")
         return None, None
 
-    status = st.status("Running the ExSTraQt pipeline...", expanded=True)
+    status = st.status("Running the ExSTraQt pipeline from scratch...", expanded=True)
 
     with status:
         st.write("**1/5** Cleaning + typing the raw CSV...")
@@ -168,33 +151,14 @@ def compute_from_upload(uploaded_file, cache_key: str, threshold: float):
         del s, d, preds, succs
         gc.collect()
 
-        st.write("**3/5** Loading cached ExSTraQt node features (account graph, "
-                 "Leiden communities, flow tracing)...")
+        st.write("**3/5** Building ExSTraQt node features from scratch (account graph, "
+                 "Leiden communities, flow tracing) -- no cache involved, this is computed "
+                 "fresh from the uploaded file's own transactions...")
         node_features = fm.build_node_feature_table(
             GRAPH_CACHE_DIR, COMMUNITY_CACHE_DIR, FEATURE_CACHE_DIR,
-            df, cache_key=cache_key, use_cache=True,
+            df, cache_key="dashboard_upload", use_cache=False,
         )
-
-        # --- consistency guard: do the uploaded file's accounts actually exist
-        #     in the cached node table? If not, the caches belong to a different
-        #     file and every ExSTraQt feature would silently be zero-filled. ---
-        uploaded_accounts = pd.unique(pd.concat(
-            [df["Sender Account"].astype(str), df["Receiver Account"].astype(str)],
-            ignore_index=True,
-        ))
-        cached_accounts = set(node_features.index.astype(str))
-        overlap = np.mean([a in cached_accounts for a in uploaded_accounts[:20_000]])
-        if overlap < 0.5:
-            st.error(
-                f"**Cache / upload mismatch.** Only {overlap:.1%} of the uploaded file's "
-                f"accounts appear in the `{cache_key}` cached node table. These caches were "
-                f"built from a different file, so the graph features would be almost entirely "
-                f"zeros and the scores meaningless. Pick the matching cache key, or upload "
-                f"the file these caches were built from."
-            )
-            status.update(label="Aborted -- cache/upload mismatch", state="error")
-            return None, None
-        st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;Account overlap with cache: **{overlap:.1%}** — OK.")
+        st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;{len(node_features):,} accounts profiled.")
 
         st.write(f"**4/5** Scoring {len(df):,} transactions (in {SCORE_BATCH_SIZE:,}-row chunks)...")
         probs = _score_in_chunks(model, df, node_features)
@@ -256,7 +220,7 @@ else:
              "Account.1, Amount Received/Paid, currencies, Payment Format, Is Laundering.",
     )
     if uploaded is not None:
-        txn_view, acct_view = compute_from_upload(uploaded, cache_key, risk_threshold)
+        txn_view, acct_view = compute_from_upload(uploaded, risk_threshold)
     else:
         st.info("Upload a CSV to run the pipeline.")
 
@@ -331,24 +295,24 @@ if txn_view is not None and acct_view is not None:
         )
 
     # ---------------- Model Insights ----------------
-    with tab_model:
-        model = load_model()
-        if model is None:
-            st.warning(f"No model at `{MODEL_PATH}` — feature importance unavailable.")
-        else:
-            st.subheader("What drives the model's risk scores")
-            st.caption(
-                "Gain-based importance from the single XGBoost model, normalized to sum to 1. "
-                "Raw account identity and bank IDs are deliberately excluded from the feature "
-                "set — they don't transfer across datasets (HI and LI share ~1% of accounts). "
-                "The `src_exq_*` / `dst_exq_*` features are the ExSTraQt graph features for the "
-                "sender and receiver respectively."
-            )
-            imp = model.feature_importance(top_n=25)
-            fig = px.bar(
-                imp.sort_values("importance"), x="importance", y="feature",
-                orientation="h", height=700,
-                title="Top 25 features by gain",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(imp, use_container_width=True, hide_index=True)
+    # with tab_model:
+    #     model = load_model()
+    #     if model is None:
+    #         st.warning(f"No model at `{MODEL_PATH}` — feature importance unavailable.")
+    #     else:
+    #         st.subheader("What drives the model's risk scores")
+    #         st.caption(
+    #             "Gain-based importance from the single XGBoost model, normalized to sum to 1. "
+    #             "Raw account identity and bank IDs are deliberately excluded from the feature "
+    #             "set — they don't transfer across datasets (HI and LI share ~1% of accounts). "
+    #             "The `src_exq_*` / `dst_exq_*` features are the ExSTraQt graph features for the "
+    #             "sender and receiver respectively."
+    #         )
+    #         imp = model.feature_importance(top_n=25)
+    #         fig = px.bar(
+    #             imp.sort_values("importance"), x="importance", y="feature",
+    #             orientation="h", height=700,
+    #             title="Top 25 features by gain",
+    #         )
+    #         st.plotly_chart(fig, use_container_width=True)
+    #         st.dataframe(imp, use_container_width=True, hide_index=True)
